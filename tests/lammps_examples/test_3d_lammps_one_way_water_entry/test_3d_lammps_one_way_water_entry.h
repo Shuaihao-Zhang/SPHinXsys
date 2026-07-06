@@ -34,11 +34,9 @@ inline constexpr Real kSphereDiameter = 2.0 * kSphereRadius;
 inline constexpr Real kParticleSpacing = kSphereDiameter / 10.0;
 inline constexpr Real kBoundaryWidth = 4.0 * kParticleSpacing;
 inline constexpr Real kInitialClearance = 0.010;
-inline constexpr Real kCouplingDt = 5.0e-4;
-inline constexpr double kLammpsDt = 1.0e-5;
-inline constexpr int kLammpsSubstepsPerCouplingStep = 50;
-inline constexpr int kTotalCouplingSteps = 120;
-inline constexpr int kVtpOutputEvery = 20;
+inline constexpr Real kEndTime = 0.06;
+inline constexpr Real kVtpOutputInterval = 0.01;
+inline constexpr double kDemMaxDt = 1.0e-5;
 inline constexpr int kRelaxationSteps = 1000;
 inline constexpr int kRelaxationOutputInterval = 200;
 //----------------------------------------------------------------------
@@ -273,7 +271,7 @@ class LammpsDEMAdapter
              << "fix int all nve/sphere\n"
              << "fix grav all gravity " << kGravity << " vector 0.0 0.0 -1.0\n"
              << "fix ext all external pf/callback 1 1\n"
-             << "timestep " << kLammpsDt << "\n"
+             << "timestep " << kDemMaxDt << "\n"
              << "thermo 1000000\n";
 
         lammps_.commands_string(cmds.str(), "LAMMPS initialization commands");
@@ -283,7 +281,50 @@ class LammpsDEMAdapter
 
     void runSubsteps(int steps)
     {
+        if (steps <= 0)
+        {
+            return;
+        }
         lammps_.command("run " + std::to_string(steps) + " post no", "LAMMPS run chunk");
+    }
+
+    void setTimestep(double dem_timestep)
+    {
+        std::ostringstream cmd;
+        cmd << std::setprecision(17) << "timestep " << dem_timestep;
+        lammps_.command(cmd.str(), "LAMMPS timestep update");
+    }
+
+    // Synchronize LAMMPS to one SPH acoustic step. The one-way case still
+    // advances LAMMPS without SPH force feedback, but the DEM time interval
+    // is kept identical to the SPH acoustic interval.
+    int runForDuration(Real acoustic_step)
+    {
+        if (acoustic_step <= TinyReal)
+        {
+            return 0;
+        }
+
+        const int full_steps = static_cast<int>(std::floor(acoustic_step / kDemMaxDt));
+        const Real remainder = acoustic_step - static_cast<Real>(full_steps) * kDemMaxDt;
+        int executed_steps = 0;
+
+        if (full_steps > 0)
+        {
+            setTimestep(kDemMaxDt);
+            runSubsteps(full_steps);
+            executed_steps += full_steps;
+        }
+
+        if (remainder > TinyReal)
+        {
+            setTimestep(remainder);
+            runSubsteps(1);
+            setTimestep(kDemMaxDt);
+            executed_steps += 1;
+        }
+
+        return executed_steps;
     }
 
     DEMState pullState() const
@@ -376,21 +417,21 @@ class DrivenSphereBoundary
 //----------------------------------------------------------------------
 struct MotionSample
 {
-    int coupling_step = 0;
+    int number_of_iterations = 0;
     int lammps_step = 0;
     Real time = 0.0;
     DEMState dem_state;
     Vec3d sph_geometric_center = Vec3d::Zero();
     Real center_error = 0.0;
-    Real z_exact = 0.0;
-    Real vz_exact = 0.0;
-    Real z_error = 0.0;
-    Real vz_error = 0.0;
+    Real z_freefall = 0.0;
+    Real vz_freefall = 0.0;
+    Real z_minus_freefall = 0.0;
+    Real vz_minus_freefall = 0.0;
 };
 
 struct ForceSample
 {
-    int coupling_step = 0;
+    int number_of_iterations = 0;
     Real time = 0.0;
     Vec3d force = Vec3d::Zero();
     Real force_norm = 0.0;
@@ -576,29 +617,34 @@ inline Vec3d sum_sphere_hydro_force(SPHBody &sphere)
     return total;
 }
 
-inline MotionSample make_motion_sample(int coupling_step,
+inline MotionSample make_motion_sample(int number_of_iterations,
+                                       int lammps_step,
+                                       Real time,
                                        const DEMState &dem_state,
                                        const Vec3d &sph_geometric_center)
 {
     MotionSample sample;
-    sample.coupling_step = coupling_step;
-    sample.lammps_step = coupling_step * kLammpsSubstepsPerCouplingStep;
-    sample.time = coupling_step * kCouplingDt;
+    sample.number_of_iterations = number_of_iterations;
+    sample.lammps_step = lammps_step;
+    sample.time = time;
     sample.dem_state = dem_state;
     sample.sph_geometric_center = sph_geometric_center;
     sample.center_error = (sph_geometric_center - dem_state.center).norm();
-    sample.z_exact = kInitialCenter[2] - 0.5 * kGravity * sample.time * sample.time;
-    sample.vz_exact = -kGravity * sample.time;
-    sample.z_error = dem_state.center[2] - sample.z_exact;
-    sample.vz_error = dem_state.velocity[2] - sample.vz_exact;
+    sample.z_freefall = kInitialCenter[2] - 0.5 * kGravity * sample.time * sample.time;
+    sample.vz_freefall = -kGravity * sample.time;
+    sample.z_minus_freefall = dem_state.center[2] - sample.z_freefall;
+    sample.vz_minus_freefall = dem_state.velocity[2] - sample.vz_freefall;
     return sample;
 }
 
-inline ForceSample make_force_sample(int coupling_step, const DEMState &dem_state, const Vec3d &force)
+inline ForceSample make_force_sample(int number_of_iterations,
+                                     Real time,
+                                     const DEMState &dem_state,
+                                     const Vec3d &force)
 {
     ForceSample sample;
-    sample.coupling_step = coupling_step;
-    sample.time = coupling_step * kCouplingDt;
+    sample.number_of_iterations = number_of_iterations;
+    sample.time = time;
     sample.force = force;
     sample.force_norm = force.norm();
     sample.sphere_bottom_z = dem_state.center[2] - kSphereRadius;
@@ -609,17 +655,17 @@ inline ForceSample make_force_sample(int coupling_step, const DEMState &dem_stat
 
 inline void write_motion_csv_header(std::ofstream &csv)
 {
-    csv << "coupling_step,lammps_step,time_s,"
+    csv << "number_of_iterations,lammps_step,time_s,"
            "lammps_x_m,lammps_y_m,lammps_z_m,"
            "lammps_vx_m_per_s,lammps_vy_m_per_s,lammps_vz_m_per_s,"
            "lammps_omega_x_rad_per_s,lammps_omega_y_rad_per_s,lammps_omega_z_rad_per_s,"
            "sph_center_x_m,sph_center_y_m,sph_center_z_m,"
-           "center_error_m,z_exact_m,vz_exact_m_per_s,z_error_m,vz_error_m_per_s\n";
+           "center_error_m,z_freefall_m,vz_freefall_m_per_s,z_minus_freefall_m,vz_minus_freefall_m_per_s\n";
 }
 
 inline void write_motion_csv_sample(std::ofstream &csv, const MotionSample &sample)
 {
-    csv << sample.coupling_step << ','
+    csv << sample.number_of_iterations << ','
         << sample.lammps_step << ','
         << sample.time << ','
         << sample.dem_state.center[0] << ','
@@ -635,22 +681,22 @@ inline void write_motion_csv_sample(std::ofstream &csv, const MotionSample &samp
         << sample.sph_geometric_center[1] << ','
         << sample.sph_geometric_center[2] << ','
         << sample.center_error << ','
-        << sample.z_exact << ','
-        << sample.vz_exact << ','
-        << sample.z_error << ','
-        << sample.vz_error << '\n';
+        << sample.z_freefall << ','
+        << sample.vz_freefall << ','
+        << sample.z_minus_freefall << ','
+        << sample.vz_minus_freefall << '\n';
 }
 
 inline void write_force_csv_header(std::ofstream &csv)
 {
-    csv << "coupling_step,time_s,Fx_N,Fy_N,Fz_N,force_norm_N,"
+    csv << "number_of_iterations,time_s,Fx_N,Fy_N,Fz_N,force_norm_N,"
            "sphere_bottom_z_m,geometric_entry,pre_entry_stat,post_entry_stat\n";
 }
 
 inline void write_force_csv_sample(std::ofstream &csv, const ForceSample &sample)
 {
     const bool geometric_entry = sample.sphere_bottom_z <= kWaterHeight;
-    csv << sample.coupling_step << ','
+    csv << sample.number_of_iterations << ','
         << sample.time << ','
         << sample.force[0] << ','
         << sample.force[1] << ','

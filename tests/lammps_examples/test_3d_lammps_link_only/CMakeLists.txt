@@ -4,7 +4,9 @@ PROJECT("${CURRENT_FOLDER}")
 SET(EXECUTABLE_OUTPUT_PATH "${PROJECT_BINARY_DIR}/bin/")
 
 add_executable(${PROJECT_NAME})
-target_sources(${PROJECT_NAME} PRIVATE test_3d_lammps_link_only.cpp)
+target_sources(${PROJECT_NAME} PRIVATE
+    test_3d_lammps_link_only.cpp
+    test_3d_lammps_link_only.h)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
 target_link_libraries(${PROJECT_NAME} PRIVATE LAMMPS::lammps)
 set_target_properties(${PROJECT_NAME} PROPERTIES

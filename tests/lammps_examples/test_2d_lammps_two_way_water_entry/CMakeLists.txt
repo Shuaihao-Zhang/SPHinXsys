@@ -5,10 +5,10 @@ SET(EXECUTABLE_OUTPUT_PATH "${PROJECT_BINARY_DIR}/bin/")
 
 add_executable(${PROJECT_NAME})
 target_sources(${PROJECT_NAME} PRIVATE
-    test_3d_lammps_driven_sphere.cpp
-    test_3d_lammps_driven_sphere.h)
+    test_2d_lammps_two_way_water_entry.cpp
+    test_2d_lammps_two_way_water_entry.h)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
-target_link_libraries(${PROJECT_NAME} PRIVATE sphinxsys_3d LAMMPS::lammps)
+target_link_libraries(${PROJECT_NAME} PRIVATE sphinxsys_2d LAMMPS::lammps)
 set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${EXECUTABLE_OUTPUT_PATH}"
@@ -29,4 +29,4 @@ add_test(NAME ${PROJECT_NAME}
     COMMAND ${PROJECT_NAME}
     WORKING_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
 
-set_tests_properties(${PROJECT_NAME} PROPERTIES LABELS "lammps")
+set_tests_properties(${PROJECT_NAME} PROPERTIES LABELS "lammps;water-entry;2d")

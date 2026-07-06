@@ -1,14 +1,15 @@
 /* ------------------------------------------------------------------------- *
  *                                SPHinXsys                                  *
  * ------------------------------------------------------------------------- *
- * This example tests a one-way LAMMPS-driven sphere entering a water tank.
- * LAMMPS advances the free-fall sphere, while SPHinXsys updates a matching
- * moving solid boundary and computes the hydrodynamic force for diagnostics.
+ * This example tests a loose two-way LAMMPS-driven 2D disc entering a water
+ * tank. SPHinXsys computes the hydrodynamic force on the moving cylinder
+ * boundary and sends a relaxed/capped force to LAMMPS through fix external.
+ * LAMMPS owns the disc motion and keeps fix gravity enabled.
  * ------------------------------------------------------------------------- */
-#include "test_3d_lammps_one_way_water_entry.h"
+#include "test_2d_lammps_two_way_water_entry.h"
 
 using namespace SPH;
-using namespace LammpsOneWayWaterEntry;
+using namespace LammpsTwoWayWaterEntry2D;
 
 int main(int ac, char *av[])
 {
@@ -19,40 +20,37 @@ int main(int ac, char *av[])
         //----------------------------------------------------------------------
         SPHSystem sph_system(kSystemDomainBounds, kParticleSpacing);
         sph_system.setRunParticleRelaxation(false);
-        sph_system.setReloadParticles(reload_particle_file_exists() || std::filesystem::exists(fixed_sphere_reload_file()));
+        sph_system.setReloadParticles(reload_particle_file_exists());
         sph_system.handleCommandlineOptions(ac, av);
 
         if (sph_system.RunParticleRelaxation())
         {
             sph_system.setReloadParticles(false);
-            std::cout << "Particle relaxation mode: reload particles disabled; generating sphere particles from lattice.\n";
+            std::cout << "Particle relaxation mode: reload particles disabled; generating cylinder particles from lattice.\n";
         }
-        else if (sph_system.ReloadParticles())
+        else if (sph_system.ReloadParticles() && !reload_particle_file_exists())
         {
-            import_fixed_sphere_reload_if_available();
-            if (!reload_particle_file_exists())
-            {
-                std::cout << "WARNING: particle reload was requested, but "
-                          << std::filesystem::absolute(reload_particle_file()).string()
-                          << " was not found. Falling back to lattice particles.\n";
-                sph_system.setReloadParticles(false);
-            }
+            std::cout << "WARNING: particle reload was requested, but "
+                      << std::filesystem::absolute(reload_particle_file()).string()
+                      << " was not found. Falling back to lattice particles.\n";
+            sph_system.setReloadParticles(false);
         }
 
         //----------------------------------------------------------------------
         //	Creating bodies with corresponding materials and particles.
         //----------------------------------------------------------------------
-        SolidBody sphere_boundary(
-            sph_system, makeShared<GeometricShapeBall>(kInitialCenter, kSphereRadius, "LammpsDrivenWaterEntrySphere"));
-        sphere_boundary.defineMatterMaterial<Solid>(kSphereDensity);
-        const std::string sphere_particle_source = generate_sphere_boundary_particles(sph_system, sphere_boundary);
+        SolidBody cylinder_boundary(
+            sph_system, makeShared<CylinderBoundaryShape>("LammpsTwoWayWaterEntryCylinder"));
+        cylinder_boundary.defineMatterMaterial<Solid>(kCylinderDensity);
+        const std::string cylinder_particle_source =
+            generate_cylinder_boundary_particles(sph_system, cylinder_boundary);
 
         if (sph_system.RunParticleRelaxation())
         {
-            return run_sphere_particle_relaxation(sphere_boundary);
+            return run_cylinder_particle_relaxation(cylinder_boundary);
         }
 
-        DrivenSphereBoundary driven_sphere(sphere_boundary, kInitialCenter);
+        DrivenCylinderBoundary driven_cylinder(cylinder_boundary, kInitialCenter);
 
         FluidBody water_block(sph_system, makeShared<WaterBlock>("WaterBody"));
         water_block.defineMatterMaterial<WeaklyCompressibleFluid>(kWaterDensity, kSoundSpeed);
@@ -67,18 +65,18 @@ int main(int ac, char *av[])
         //	Define body relations.
         //----------------------------------------------------------------------
         InnerRelation water_inner(water_block);
-        ContactRelation water_contact(water_block, {&wall_boundary, &sphere_boundary});
-        ContactRelation sphere_contact(sphere_boundary, {&water_block});
+        ContactRelation water_contact(water_block, {&wall_boundary, &cylinder_boundary});
+        ContactRelation cylinder_contact(cylinder_boundary, {&water_block});
         ComplexRelation water_complex(water_inner, water_contact);
 
         //----------------------------------------------------------------------
         //	Define all numerical methods for the fluid dynamics.
         //----------------------------------------------------------------------
         SimpleDynamics<HydrostaticPressureField> hydrostatic_pressure(water_block);
-        Gravity gravity(Vec3d(0.0, 0.0, -kGravity));
+        Gravity gravity(Vec2d(0.0, -kGravity));
         SimpleDynamics<GravityForce<Gravity>> constant_gravity(water_block, gravity);
         SimpleDynamics<NormalDirectionFromBodyShape> wall_normal_direction(wall_boundary);
-        SimpleDynamics<NormalDirectionFromBodyShape> sphere_normal_direction(sphere_boundary);
+        SimpleDynamics<NormalDirectionFromBodyShape> cylinder_normal_direction(cylinder_boundary);
 
         Dynamics1Level<fluid_dynamics::Integration1stHalfWithWallRiemann>
             pressure_relaxation(water_inner, water_contact);
@@ -98,15 +96,20 @@ int main(int ac, char *av[])
         //	Coupling between the SPHinXsys moving boundary and the water body.
         //----------------------------------------------------------------------
         InteractionWithUpdate<solid_dynamics::ViscousForceFromFluid>
-            viscous_force_on_sphere(sphere_contact);
+            viscous_force_on_cylinder(cylinder_contact);
         InteractionWithUpdate<solid_dynamics::PressureForceFromFluid<decltype(density_relaxation)>>
-            pressure_force_on_sphere(sphere_contact);
+            pressure_force_on_cylinder(cylinder_contact);
 
         //----------------------------------------------------------------------
-        //	LAMMPS owns the sphere motion. The external callback stays zero for
-        //	this one-way test and no SPH force is sent back to LAMMPS.
+        //	LAMMPS owns the disc motion. The callback receives hydrodynamic
+        //	force only; gravity is still supplied by LAMMPS fix gravity.
         //----------------------------------------------------------------------
         LammpsDEMAdapter dem_adapter;
+        const Real lammps_particle_mass = dem_adapter.particleMass();
+        const Real lammps_mass_relative_error =
+            std::abs(lammps_particle_mass - cylinder_mass()) / cylinder_mass();
+        Vec2d previous_applied_force = Vec2d::Zero();
+        dem_adapter.setExternalForce(previous_applied_force);
 
         //----------------------------------------------------------------------
         //	Define the methods for I/O operations and observations.
@@ -114,13 +117,13 @@ int main(int ac, char *av[])
         BodyStatesRecordingToVtp write_real_body_states(sph_system);
         write_real_body_states.addToWrite<Real>(water_block, "Pressure");
         write_real_body_states.addToWrite<Vecd>(wall_boundary, "NormalDirection");
-        write_real_body_states.addToWrite<Vecd>(sphere_boundary, "Velocity");
-        write_real_body_states.addToWrite<Vecd>(sphere_boundary, "PressureForceFromFluid");
-        write_real_body_states.addToWrite<Vecd>(sphere_boundary, "ViscousForceFromFluid");
-        write_real_body_states.addToWrite<Vecd>(sphere_boundary, "NormalDirection");
+        write_real_body_states.addToWrite<Vecd>(cylinder_boundary, "Velocity");
+        write_real_body_states.addToWrite<Vecd>(cylinder_boundary, "PressureForceFromFluid");
+        write_real_body_states.addToWrite<Vecd>(cylinder_boundary, "ViscousForceFromFluid");
+        write_real_body_states.addToWrite<Vecd>(cylinder_boundary, "NormalDirection");
 
-        const std::filesystem::path motion_csv_path = "sphere_motion.csv";
-        const std::filesystem::path force_csv_path = "sphere_force.csv";
+        const std::filesystem::path motion_csv_path = "cylinder_motion.csv";
+        const std::filesystem::path force_csv_path = "cylinder_force.csv";
         const std::filesystem::path dll_path = "liblammps.dll";
         const std::filesystem::path output_path = std::filesystem::absolute(IO::getEnvironment().OutputFolder());
 
@@ -128,11 +131,11 @@ int main(int ac, char *av[])
         std::ofstream force_csv(force_csv_path);
         if (!motion_csv)
         {
-            throw std::runtime_error("could not open sphere_motion.csv for writing");
+            throw std::runtime_error("could not open cylinder_motion.csv for writing");
         }
         if (!force_csv)
         {
-            throw std::runtime_error("could not open sphere_force.csv for writing");
+            throw std::runtime_error("could not open cylinder_force.csv for writing");
         }
         motion_csv << std::setprecision(17);
         force_csv << std::setprecision(17);
@@ -147,7 +150,7 @@ int main(int ac, char *av[])
         hydrostatic_pressure.exec();
         constant_gravity.exec();
         wall_normal_direction.exec();
-        sphere_normal_direction.exec();
+        cylinder_normal_direction.exec();
 
         Real &physical_time = *sph_system.getSystemVariableDataByName<Real>("PhysicalTime");
         physical_time = 0.0;
@@ -156,39 +159,37 @@ int main(int ac, char *av[])
         //	Initial diagnostics before the time stepping starts.
         //----------------------------------------------------------------------
         Real max_center_error = 0.0;
-        Real max_abs_z_minus_freefall = 0.0;
-        Real max_abs_vz_minus_freefall = 0.0;
+        Real max_abs_y_minus_freefall = 0.0;
+        Real max_abs_vy_minus_freefall = 0.0;
+        bool finite_state = true;
         ForceStats force_stats;
         MotionSample final_motion_sample;
         int number_of_iterations = 0;
         int lammps_step_count = 0;
 
         DEMState dem_state = dem_adapter.pullState();
-        driven_sphere.update(dem_state);
-        update_water_sphere_configuration(water_block, sphere_boundary, water_complex, sphere_contact);
-        viscous_force_on_sphere.exec();
-        pressure_force_on_sphere.exec();
+        driven_cylinder.update(dem_state);
+        update_water_cylinder_configuration(water_block, cylinder_boundary, water_complex, cylinder_contact);
+        viscous_force_on_cylinder.exec();
+        pressure_force_on_cylinder.exec();
 
-        Vec3d hydro_force = sum_sphere_hydro_force(sphere_boundary);
-        final_motion_sample =
-            make_motion_sample(number_of_iterations, lammps_step_count, physical_time, dem_state, driven_sphere.geometricCenter());
-        ForceSample force_sample = make_force_sample(number_of_iterations, physical_time, dem_state, hydro_force);
+        Vec2d raw_force = sum_cylinder_hydro_force(cylinder_boundary);
+        ForceSample force_sample = make_force_sample(0, physical_time, dem_state, raw_force, previous_applied_force, false);
+        final_motion_sample = make_motion_sample(0, lammps_step_count, physical_time, dem_state, driven_cylinder.geometricCenter());
         write_motion_csv_sample(motion_csv, final_motion_sample);
         write_force_csv_sample(force_csv, force_sample);
         max_center_error = std::max(max_center_error, final_motion_sample.center_error);
-        max_abs_z_minus_freefall =
-            std::max(max_abs_z_minus_freefall, std::abs(final_motion_sample.z_minus_freefall));
-        max_abs_vz_minus_freefall =
-            std::max(max_abs_vz_minus_freefall, std::abs(final_motion_sample.vz_minus_freefall));
         force_stats.add(force_sample);
+        finite_state = finite_state && is_finite(dem_state.center) && is_finite(dem_state.velocity) &&
+                       is_finite(raw_force) && is_finite(previous_applied_force);
         write_real_body_states.writeToFile(0);
 
         //----------------------------------------------------------------------
         //	Main loop starts here. The outer loop follows the fluid advection
-        //	step and updates particle configuration at a lower frequency. The
-        //	inner acoustic loop advances pressure/density and synchronizes the
-        //	LAMMPS free-fall particle over the same acoustic interval. The
-        //	hydrodynamic force is recorded only and is never sent back to LAMMPS.
+        //	step. The inner acoustic loop advances pressure/density, computes
+        //	the hydrodynamic force on the cylinder, sends the relaxed/capped
+        //	force to LAMMPS, and advances the disc over exactly the same
+        //	acoustic interval using DEM substeps plus one short remainder step.
         //----------------------------------------------------------------------
         TickCount t1 = TickCount::now();
         TimeInterval interval;
@@ -201,12 +202,11 @@ int main(int ac, char *av[])
         {
             ++advection_iterations;
 
-            update_water_sphere_configuration(water_block, sphere_boundary, water_complex, sphere_contact);
+            update_water_cylinder_configuration(water_block, cylinder_boundary, water_complex, cylinder_contact);
             Real advection_step = SMIN(get_fluid_advection_time_step_size.exec(), kEndTime - physical_time);
-
             update_density_by_summation.exec();
             viscous_force.exec();
-            viscous_force_on_sphere.exec();
+            viscous_force_on_cylinder.exec();
 
             Real relaxation_time = 0.0;
             while (relaxation_time < advection_step - TinyReal && physical_time < kEndTime - TinyReal)
@@ -214,33 +214,39 @@ int main(int ac, char *av[])
                 const Real acoustic_step = SMIN(get_fluid_time_step_size.exec(),
                                                 SMIN(advection_step - relaxation_time, kEndTime - physical_time));
                 pressure_relaxation.exec(acoustic_step);
-                pressure_force_on_sphere.exec();
+                pressure_force_on_cylinder.exec();
                 density_relaxation.exec(acoustic_step);
 
-                hydro_force = sum_sphere_hydro_force(sphere_boundary);
+                raw_force = sum_cylinder_hydro_force(cylinder_boundary);
+                const ForceApplication force_application = relax_and_cap_force(raw_force, previous_applied_force);
+                previous_applied_force = force_application.applied_force;
+                dem_adapter.setExternalForce(previous_applied_force);
 
-                // One-way coupling: LAMMPS advances under gravity only. No SPH
-                // hydrodynamic force is pushed through fix external in this case.
                 lammps_step_count += dem_adapter.runForDuration(acoustic_step);
                 dem_state = dem_adapter.pullState();
-                driven_sphere.update(dem_state);
+                driven_cylinder.update(dem_state);
 
                 relaxation_time += acoustic_step;
                 physical_time += acoustic_step;
                 ++number_of_iterations;
 
                 final_motion_sample =
-                    make_motion_sample(number_of_iterations, lammps_step_count, physical_time, dem_state, driven_sphere.geometricCenter());
-                force_sample = make_force_sample(number_of_iterations, physical_time, dem_state, hydro_force);
+                    make_motion_sample(number_of_iterations, lammps_step_count, physical_time, dem_state, driven_cylinder.geometricCenter());
+                force_sample = make_force_sample(
+                    number_of_iterations, physical_time, dem_state, raw_force, previous_applied_force, force_application.capped);
 
                 write_motion_csv_sample(motion_csv, final_motion_sample);
                 write_force_csv_sample(force_csv, force_sample);
+
                 max_center_error = std::max(max_center_error, final_motion_sample.center_error);
-                max_abs_z_minus_freefall =
-                    std::max(max_abs_z_minus_freefall, std::abs(final_motion_sample.z_minus_freefall));
-                max_abs_vz_minus_freefall =
-                    std::max(max_abs_vz_minus_freefall, std::abs(final_motion_sample.vz_minus_freefall));
+                max_abs_y_minus_freefall =
+                    std::max(max_abs_y_minus_freefall, std::abs(final_motion_sample.y_minus_freefall));
+                max_abs_vy_minus_freefall =
+                    std::max(max_abs_vy_minus_freefall, std::abs(final_motion_sample.vy_minus_freefall));
                 force_stats.add(force_sample);
+                finite_state = finite_state && is_finite(dem_state.center) && is_finite(dem_state.velocity) &&
+                               is_finite(raw_force) && is_finite(previous_applied_force) &&
+                               std::isfinite(final_motion_sample.center_error);
 
                 if (number_of_iterations % screen_output_interval == 0)
                 {
@@ -249,9 +255,10 @@ int main(int ac, char *av[])
                               << " Time = " << physical_time
                               << " advection_step = " << advection_step
                               << " acoustic_step = " << acoustic_step
-                              << " z = " << dem_state.center[2]
-                              << " vz = " << dem_state.velocity[2]
-                              << " Fz = " << hydro_force[2] << "\n";
+                              << " y = " << dem_state.center[1]
+                              << " vy = " << dem_state.velocity[1]
+                              << " Fy_raw = " << raw_force[1]
+                              << " Fy_applied = " << previous_applied_force[1] << "\n";
                 }
 
                 if (physical_time + TinyReal >= next_output_time || physical_time + TinyReal >= kEndTime)
@@ -267,10 +274,9 @@ int main(int ac, char *av[])
             {
                 particle_sorting.exec();
             }
-            update_water_sphere_configuration(water_block, sphere_boundary, water_complex, sphere_contact);
+            update_water_cylinder_configuration(water_block, cylinder_boundary, water_complex, cylinder_contact);
             TickCount t3 = TickCount::now();
             interval += t3 - t2;
-
         }
         TickCount t4 = TickCount::now();
 
@@ -281,25 +287,41 @@ int main(int ac, char *av[])
         //	Statistics and regression-style checks.
         //----------------------------------------------------------------------
         const ExternalForce &external_force = dem_adapter.externalForce();
-        const Vec3d pre_entry_mean_force = force_stats.pre_entry_mean_force();
+        const Vec2d pre_entry_mean_force = force_stats.pre_entry_mean_force();
         const Real pre_entry_mean_force_norm = force_stats.pre_entry_mean_force_norm();
-        const Real post_entry_max_fz =
-            force_stats.post_entry_count > 0 ? force_stats.post_entry_max_fz : 0.0;
+        const Real post_entry_max_raw_fy =
+            force_stats.post_entry_count > 0 ? force_stats.max_raw_fy : 0.0;
+        const Real post_entry_max_applied_fy =
+            force_stats.post_entry_count > 0 ? force_stats.max_applied_fy : 0.0;
+        const Real final_vy_two_way = final_motion_sample.dem_state.velocity[1];
+        const Real final_vy_freefall = final_motion_sample.vy_freefall;
+        const Real final_y_two_way = final_motion_sample.dem_state.center[1];
+        const Real final_y_freefall = final_motion_sample.y_freefall;
+        const Real final_cylinder_top_y = final_y_two_way + kCylinderRadius;
+        const Real final_cylinder_bottom_y = final_y_two_way - kCylinderRadius;
+        const Real final_top_submergence = kWaterHeight - final_cylinder_top_y;
         const TickCount::interval_t tt = t4 - t1 - interval;
 
         std::cout << std::setprecision(17);
-        std::cout << "SPHinXsys one-way LAMMPS-driven water-entry example\n";
+        std::cout << "SPHinXsys 2D two-way LAMMPS-driven water-entry example\n";
         std::cout << "Total wall time for computation: " << tt.seconds() << " seconds.\n";
         std::cout << "liblammps_dll_in_working_directory: " << (std::filesystem::exists(dll_path) ? "yes" : "no") << '\n';
         std::cout << "lammps_version: " << dem_adapter.version() << '\n';
-        std::cout << "sphere_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
-        std::cout << "sphere_force_csv: " << std::filesystem::absolute(force_csv_path).string() << '\n';
+        std::cout << "cylinder_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
+        std::cout << "cylinder_force_csv: " << std::filesystem::absolute(force_csv_path).string() << '\n';
         std::cout << "VTP_output_folder: " << output_path.string() << '\n';
         std::cout << "reload_file: " << std::filesystem::absolute(reload_particle_file()).string() << '\n';
-        std::cout << "sphere_particle_source: " << sphere_particle_source << '\n';
+        std::cout << "cylinder_particle_source: " << cylinder_particle_source << '\n';
         std::cout << "water_particles: " << water_block.getBaseParticles().TotalRealParticles() << '\n';
-        std::cout << "sphere_particles: " << driven_sphere.particleCount() << '\n';
-        std::cout << "sphere_mass_kg: " << sphere_mass() << '\n';
+        std::cout << "cylinder_particles: " << driven_cylinder.particleCount() << '\n';
+        std::cout << "cylinder_mass_per_unit_depth_kg_per_m: " << cylinder_mass() << '\n';
+        std::cout << "lammps_equivalent_sphere_density_kg_per_m3: " << lammps_equivalent_sphere_density() << '\n';
+        std::cout << "lammps_particle_mass_kg: " << lammps_particle_mass << '\n';
+        std::cout << "lammps_particle_mass_relative_error: " << lammps_mass_relative_error << '\n';
+        std::cout << "cylinder_weight_per_unit_depth_N_per_m: " << cylinder_weight() << '\n';
+        std::cout << "force_relaxation_alpha: " << kForceRelaxationAlpha << '\n';
+        std::cout << "force_cap_N_per_m: " << kForceCapWeightFactor * cylinder_weight() << '\n';
+        std::cout << "force_cap_trigger_count: " << force_stats.cap_count << '\n';
         std::cout << "dem_max_dt_s: " << kDemMaxDt << '\n';
         std::cout << "advection_iterations: " << advection_iterations << '\n';
         std::cout << "number_of_iterations: " << number_of_iterations << '\n';
@@ -310,30 +332,36 @@ int main(int ac, char *av[])
                   << external_force.force[0] << ','
                   << external_force.force[1] << ','
                   << external_force.force[2] << '\n';
+        std::cout << "external_force_feedback_includes_gravity: no\n";
         std::cout << "callback_calls: " << external_force.callback_calls << '\n';
         std::cout << "atom1_force_updates: " << external_force.atom1_updates << '\n';
         std::cout << "final_lammps_center_m: "
                   << final_motion_sample.dem_state.center[0] << ','
-                  << final_motion_sample.dem_state.center[1] << ','
-                  << final_motion_sample.dem_state.center[2] << '\n';
+                  << final_motion_sample.dem_state.center[1] << '\n';
         std::cout << "final_sph_geometric_center_m: "
                   << final_motion_sample.sph_geometric_center[0] << ','
-                  << final_motion_sample.sph_geometric_center[1] << ','
-                  << final_motion_sample.sph_geometric_center[2] << '\n';
-        std::cout << "final_vz_m_per_s: " << final_motion_sample.dem_state.velocity[2] << '\n';
-        std::cout << "final_z_freefall_m: " << final_motion_sample.z_freefall << '\n';
-        std::cout << "final_vz_freefall_m_per_s: " << final_motion_sample.vz_freefall << '\n';
+                  << final_motion_sample.sph_geometric_center[1] << '\n';
+        std::cout << "final_vy_two_way_m_per_s: " << final_vy_two_way << '\n';
+        std::cout << "final_vy_freefall_m_per_s: " << final_vy_freefall << '\n';
+        std::cout << "final_vy_difference_m_per_s: " << final_motion_sample.vy_minus_freefall << '\n';
+        std::cout << "final_y_two_way_m: " << final_y_two_way << '\n';
+        std::cout << "final_y_freefall_m: " << final_y_freefall << '\n';
+        std::cout << "final_y_difference_m: " << final_motion_sample.y_minus_freefall << '\n';
+        std::cout << "final_cylinder_top_y_m: " << final_cylinder_top_y << '\n';
+        std::cout << "final_cylinder_bottom_y_m: " << final_cylinder_bottom_y << '\n';
+        std::cout << "final_top_submergence_m: " << final_top_submergence << '\n';
         std::cout << "max_center_error_m: " << max_center_error << '\n';
-        std::cout << "max_abs_z_minus_freefall_m: " << max_abs_z_minus_freefall << '\n';
-        std::cout << "max_abs_vz_minus_freefall_m_per_s: " << max_abs_vz_minus_freefall << '\n';
+        std::cout << "max_abs_y_minus_freefall_m: " << max_abs_y_minus_freefall << '\n';
+        std::cout << "max_abs_vy_minus_freefall_m_per_s: " << max_abs_vy_minus_freefall << '\n';
         std::cout << "pre_entry_samples: " << force_stats.pre_entry_count << '\n';
-        std::cout << "pre_entry_mean_force_N: "
+        std::cout << "pre_entry_mean_applied_force_N: "
                   << pre_entry_mean_force[0] << ','
-                  << pre_entry_mean_force[1] << ','
-                  << pre_entry_mean_force[2] << '\n';
-        std::cout << "pre_entry_mean_force_norm_N: " << pre_entry_mean_force_norm << '\n';
+                  << pre_entry_mean_force[1] << '\n';
+        std::cout << "pre_entry_mean_applied_force_norm_N: " << pre_entry_mean_force_norm << '\n';
         std::cout << "post_entry_samples: " << force_stats.post_entry_count << '\n';
-        std::cout << "post_entry_max_Fz_N: " << post_entry_max_fz << '\n';
+        std::cout << "post_entry_max_raw_Fy_N: " << post_entry_max_raw_fy << '\n';
+        std::cout << "post_entry_max_applied_Fy_N: " << post_entry_max_applied_fy << '\n';
+        std::cout << "finite_state: " << (finite_state ? "yes" : "no") << '\n';
 
         if (!std::filesystem::exists(dll_path))
         {
@@ -345,9 +373,14 @@ int main(int ac, char *av[])
             std::cerr << "ERROR: fix external callback did not update atom id=1.\n";
             return 1;
         }
-        if (external_force.force[0] != 0.0 || external_force.force[1] != 0.0 || external_force.force[2] != 0.0)
+        if (!finite_state)
         {
-            std::cerr << "ERROR: hydrodynamic force feedback to LAMMPS is not disabled.\n";
+            std::cerr << "ERROR: non-finite value detected in DEM state or force history.\n";
+            return 1;
+        }
+        if (lammps_mass_relative_error > kMassRelativeTolerance)
+        {
+            std::cerr << "ERROR: LAMMPS particle mass does not match the SPHinXsys 2D unit-depth cylinder mass.\n";
             return 1;
         }
         if (max_center_error > kCenterErrorTolerance)
@@ -356,20 +389,39 @@ int main(int ac, char *av[])
                       << kCenterErrorTolerance << ".\n";
             return 1;
         }
-        if (max_abs_z_minus_freefall > kFreeFallErrorTolerance || max_abs_vz_minus_freefall > kFreeFallErrorTolerance)
-        {
-            std::cerr << "ERROR: LAMMPS free-fall error exceeded tolerance "
-                      << kFreeFallErrorTolerance << ".\n";
-            return 1;
-        }
         if (force_stats.pre_entry_count == 0 || pre_entry_mean_force_norm > kPreEntryForceNormTolerance)
         {
-            std::cerr << "ERROR: pre-entry hydrodynamic force is not close to zero.\n";
+            std::cerr << "ERROR: pre-entry applied hydrodynamic force is not close to zero.\n";
             return 1;
         }
-        if (force_stats.post_entry_count == 0 || post_entry_max_fz < kMinimumPostEntryFz)
+        if (force_stats.post_entry_count == 0 || post_entry_max_applied_fy < kMinimumPostEntryFy)
         {
-            std::cerr << "ERROR: post-entry upward hydrodynamic force response is too small.\n";
+            std::cerr << "ERROR: post-entry upward applied hydrodynamic force response is too small.\n";
+            return 1;
+        }
+        if (final_vy_two_way <= final_vy_freefall)
+        {
+            std::cerr << "ERROR: two-way velocity did not become less negative than free fall.\n";
+            return 1;
+        }
+        if (final_motion_sample.y_minus_freefall <= kMinimumTrajectoryDifference)
+        {
+            std::cerr << "ERROR: two-way trajectory did not separate enough from free fall.\n";
+            return 1;
+        }
+        if (final_top_submergence < kMinimumFinalTopSubmergence)
+        {
+            std::cerr << "ERROR: dense cylinder did not sink below the free surface enough; it may be rebounding at entry.\n";
+            return 1;
+        }
+        if (final_vy_two_way >= 0.0)
+        {
+            std::cerr << "ERROR: dense cylinder is moving upward at the end of the water-entry check.\n";
+            return 1;
+        }
+        if (final_cylinder_bottom_y <= kParticleSpacing)
+        {
+            std::cerr << "ERROR: water-entry check ran too close to the tank bottom for this no-contact DEM setup.\n";
             return 1;
         }
 

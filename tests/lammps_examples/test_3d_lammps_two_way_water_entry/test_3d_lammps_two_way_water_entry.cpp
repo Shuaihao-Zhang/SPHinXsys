@@ -89,6 +89,8 @@ int main(int ac, char *av[])
             update_density_by_summation(water_inner, water_contact);
         InteractionWithUpdate<fluid_dynamics::ViscousForceWithWall>
             viscous_force(water_inner, water_contact);
+        ReduceDynamics<fluid_dynamics::AdvectionViscousTimeStep>
+            get_fluid_advection_time_step_size(water_block, kCharacteristicVelocity);
         ReduceDynamics<fluid_dynamics::AcousticTimeStep>
             get_fluid_time_step_size(water_block);
         ParticleSorting particle_sorting(water_block);
@@ -162,6 +164,8 @@ int main(int ac, char *av[])
         bool finite_state = true;
         ForceStats force_stats;
         MotionSample final_motion_sample;
+        int number_of_iterations = 0;
+        int lammps_step_count = 0;
 
         DEMState dem_state = dem_adapter.pullState();
         driven_sphere.update(dem_state);
@@ -170,8 +174,8 @@ int main(int ac, char *av[])
         pressure_force_on_sphere.exec();
 
         Vec3d raw_force = sum_sphere_hydro_force(sphere_boundary);
-        ForceSample force_sample = make_force_sample(0, dem_state, raw_force, previous_applied_force, false);
-        final_motion_sample = make_motion_sample(0, dem_state, driven_sphere.geometricCenter());
+        ForceSample force_sample = make_force_sample(0, physical_time, dem_state, raw_force, previous_applied_force, false);
+        final_motion_sample = make_motion_sample(0, lammps_step_count, physical_time, dem_state, driven_sphere.geometricCenter());
         write_motion_csv_sample(motion_csv, final_motion_sample);
         write_force_csv_sample(force_csv, force_sample);
         max_center_error = std::max(max_center_error, final_motion_sample.center_error);
@@ -181,90 +185,105 @@ int main(int ac, char *av[])
         write_real_body_states.writeToFile(0);
 
         //----------------------------------------------------------------------
-        //	Main loop starts here. This is explicit loose coupling:
-        //	1. compute hydrodynamic force from current SPH/DEM state,
-        //	2. relax/cap and push it to LAMMPS,
-        //	3. run LAMMPS to the next coupling time,
-        //	4. pull the new DEM state and update the SPHinXsys boundary.
+        //	Main loop starts here. The outer loop follows the fluid advection
+        //	step and updates particle configuration at a lower frequency. The
+        //	inner acoustic loop advances pressure/density and performs loose
+        //	SPH-DEM coupling. For every SPH acoustic step, the current
+        //	hydrodynamic force is relaxed/capped, passed to LAMMPS through
+        //	fix external, and LAMMPS is advanced over the same acoustic
+        //	interval using full DEM steps plus one short remainder step.
         //----------------------------------------------------------------------
         TickCount t1 = TickCount::now();
         TimeInterval interval;
         const int screen_output_interval = 20;
-        int number_of_iterations = 0;
+        int advection_iterations = 0;
+        int output_iteration = 0;
+        Real next_output_time = kVtpOutputInterval;
 
-        for (int coupling_step = 1; coupling_step <= kTotalCouplingSteps; ++coupling_step)
+        while (physical_time < kEndTime - TinyReal)
         {
-            ++number_of_iterations;
+            ++advection_iterations;
 
             update_water_sphere_configuration(water_block, sphere_boundary, water_complex, sphere_contact);
+            Real advection_step = SMIN(get_fluid_advection_time_step_size.exec(), kEndTime - physical_time);
             update_density_by_summation.exec();
             viscous_force.exec();
             viscous_force_on_sphere.exec();
 
             Real relaxation_time = 0.0;
-            while (relaxation_time < kCouplingDt - TinyReal)
+            while (relaxation_time < advection_step - TinyReal && physical_time < kEndTime - TinyReal)
             {
-                const Real dt = SMIN(get_fluid_time_step_size.exec(), kCouplingDt - relaxation_time);
-                pressure_relaxation.exec(dt);
+                const Real acoustic_step = SMIN(get_fluid_time_step_size.exec(),
+                                                SMIN(advection_step - relaxation_time, kEndTime - physical_time));
+                pressure_relaxation.exec(acoustic_step);
                 pressure_force_on_sphere.exec();
-                density_relaxation.exec(dt);
+                density_relaxation.exec(acoustic_step);
 
-                relaxation_time += dt;
-                physical_time += dt;
+                raw_force = sum_sphere_hydro_force(sphere_boundary);
+                const ForceApplication force_application = relax_and_cap_force(raw_force, previous_applied_force);
+                previous_applied_force = force_application.applied_force;
+                // The LAMMPS callback reads this force on every DEM substep.
+                // It is the hydrodynamic force only; gravity remains a LAMMPS fix.
+                dem_adapter.setExternalForce(previous_applied_force);
+
+                // Advance LAMMPS over exactly the same interval as the SPH acoustic step.
+                // The adapter uses nominal DEM steps plus one short remainder step if needed.
+                lammps_step_count += dem_adapter.runForDuration(acoustic_step);
+                dem_state = dem_adapter.pullState();
+                // After DEM subcycling, impose the updated LAMMPS sphere state on the SPH boundary particles.
+                driven_sphere.update(dem_state);
+
+                relaxation_time += acoustic_step;
+                physical_time += acoustic_step;
+                ++number_of_iterations;
+
+                final_motion_sample =
+                    make_motion_sample(number_of_iterations, lammps_step_count, physical_time, dem_state, driven_sphere.geometricCenter());
+                force_sample = make_force_sample(
+                    number_of_iterations, physical_time, dem_state, raw_force, previous_applied_force, force_application.capped);
+
+                write_motion_csv_sample(motion_csv, final_motion_sample);
+                write_force_csv_sample(force_csv, force_sample);
+
+                max_center_error = std::max(max_center_error, final_motion_sample.center_error);
+                max_abs_z_minus_freefall =
+                    std::max(max_abs_z_minus_freefall, std::abs(final_motion_sample.z_minus_freefall));
+                max_abs_vz_minus_freefall =
+                    std::max(max_abs_vz_minus_freefall, std::abs(final_motion_sample.vz_minus_freefall));
+                force_stats.add(force_sample);
+                finite_state = finite_state && is_finite(dem_state.center) && is_finite(dem_state.velocity) &&
+                               is_finite(raw_force) && is_finite(previous_applied_force) &&
+                               std::isfinite(final_motion_sample.center_error);
+
+                if (number_of_iterations % screen_output_interval == 0)
+                {
+                    std::cout << std::fixed << std::setprecision(6)
+                              << "N=" << number_of_iterations
+                              << " Time = " << physical_time
+                              << " advection_step = " << advection_step
+                              << " acoustic_step = " << acoustic_step
+                              << " z = " << dem_state.center[2]
+                              << " vz = " << dem_state.velocity[2]
+                              << " Fz_raw = " << raw_force[2]
+                              << " Fz_applied = " << previous_applied_force[2] << "\n";
+                }
+
+                if (physical_time + TinyReal >= next_output_time || physical_time + TinyReal >= kEndTime)
+                {
+                    output_iteration = number_of_iterations;
+                    write_real_body_states.writeToFile(output_iteration);
+                    next_output_time += kVtpOutputInterval;
+                }
             }
-            physical_time = static_cast<Real>(coupling_step) * kCouplingDt;
-
-            raw_force = sum_sphere_hydro_force(sphere_boundary);
-            const ForceApplication force_application = relax_and_cap_force(raw_force, previous_applied_force);
-            previous_applied_force = force_application.applied_force;
-            dem_adapter.setExternalForce(previous_applied_force);
-
-            dem_adapter.runSubsteps(kLammpsSubstepsPerCouplingStep);
-            dem_state = dem_adapter.pullState();
-            driven_sphere.update(dem_state);
 
             TickCount t2 = TickCount::now();
-            if (number_of_iterations % 100 == 0)
+            if (advection_iterations % 100 == 0)
             {
                 particle_sorting.exec();
             }
             update_water_sphere_configuration(water_block, sphere_boundary, water_complex, sphere_contact);
             TickCount t3 = TickCount::now();
             interval += t3 - t2;
-
-            final_motion_sample =
-                make_motion_sample(coupling_step, dem_state, driven_sphere.geometricCenter());
-            force_sample = make_force_sample(
-                coupling_step, dem_state, raw_force, previous_applied_force, force_application.capped);
-
-            write_motion_csv_sample(motion_csv, final_motion_sample);
-            write_force_csv_sample(force_csv, force_sample);
-
-            max_center_error = std::max(max_center_error, final_motion_sample.center_error);
-            max_abs_z_minus_freefall =
-                std::max(max_abs_z_minus_freefall, std::abs(final_motion_sample.z_minus_freefall));
-            max_abs_vz_minus_freefall =
-                std::max(max_abs_vz_minus_freefall, std::abs(final_motion_sample.vz_minus_freefall));
-            force_stats.add(force_sample);
-            finite_state = finite_state && is_finite(dem_state.center) && is_finite(dem_state.velocity) &&
-                           is_finite(raw_force) && is_finite(previous_applied_force) &&
-                           std::isfinite(final_motion_sample.center_error);
-
-            if (number_of_iterations % screen_output_interval == 0)
-            {
-                std::cout << std::fixed << std::setprecision(6)
-                          << "N=" << number_of_iterations
-                          << " Time = " << physical_time
-                          << " z = " << dem_state.center[2]
-                          << " vz = " << dem_state.velocity[2]
-                          << " Fz_raw = " << raw_force[2]
-                          << " Fz_applied = " << previous_applied_force[2] << "\n";
-            }
-
-            if (coupling_step % kVtpOutputEvery == 0 || coupling_step == kTotalCouplingSteps)
-            {
-                write_real_body_states.writeToFile(coupling_step);
-            }
         }
         TickCount t4 = TickCount::now();
 
@@ -304,8 +323,12 @@ int main(int ac, char *av[])
         std::cout << "force_relaxation_alpha: " << kForceRelaxationAlpha << '\n';
         std::cout << "force_cap_N: " << kForceCapWeightFactor * sphere_weight() << '\n';
         std::cout << "force_cap_trigger_count: " << force_stats.cap_count << '\n';
+        std::cout << "dem_max_dt_s: " << kDemMaxDt << '\n';
+        std::cout << "advection_iterations: " << advection_iterations << '\n';
+        std::cout << "number_of_iterations: " << number_of_iterations << '\n';
+        std::cout << "lammps_substeps_executed: " << lammps_step_count << '\n';
         std::cout << "entry_time_s: " << water_entry_time() << '\n';
-        std::cout << "end_time_s: " << kTotalCouplingSteps * kCouplingDt << '\n';
+        std::cout << "end_time_s: " << kEndTime << '\n';
         std::cout << "external_force_feedback_N: "
                   << external_force.force[0] << ','
                   << external_force.force[1] << ','

@@ -20,21 +20,20 @@
 
 using namespace SPH;
 
-namespace LammpsTwoWayWaterEntry
+namespace LammpsTwoWayWaterEntry2D
 {
 //----------------------------------------------------------------------
 //	Basic geometry parameters and numerical setup.
 //----------------------------------------------------------------------
 inline constexpr Real kTankLengthX = 0.12;
-inline constexpr Real kTankLengthY = 0.12;
-inline constexpr Real kTankHeightZ = 0.16;
+inline constexpr Real kTankHeightY = 0.16;
 inline constexpr Real kWaterHeight = 0.12;
-inline constexpr Real kSphereRadius = 0.01;
-inline constexpr Real kSphereDiameter = 2.0 * kSphereRadius;
-inline constexpr Real kParticleSpacing = kSphereDiameter / 10.0;
+inline constexpr Real kCylinderRadius = 0.01;
+inline constexpr Real kCylinderDiameter = 2.0 * kCylinderRadius;
+inline constexpr Real kParticleSpacing = kCylinderDiameter / 10.0;
 inline constexpr Real kBoundaryWidth = 4.0 * kParticleSpacing;
 inline constexpr Real kInitialClearance = 0.010;
-inline constexpr Real kEndTime = 0.06;
+inline constexpr Real kEndTime = 1.0;
 inline constexpr Real kVtpOutputInterval = 0.01;
 inline constexpr double kDemMaxDt = 1.0e-5;
 inline constexpr int kRelaxationSteps = 1000;
@@ -45,7 +44,7 @@ inline constexpr Real kForceCapWeightFactor = 5.0;
 //	Material parameters.
 //----------------------------------------------------------------------
 inline constexpr Real kWaterDensity = 1000.0;
-inline constexpr Real kSphereDensity = 2500.0;
+inline constexpr Real kCylinderDensity = 2500.0;
 inline constexpr Real kGravity = 9.81;
 inline constexpr Real kDynamicViscosity = 1.0e-3;
 inline const Real kCharacteristicVelocity = 2.0 * std::sqrt(kGravity * kWaterHeight);
@@ -54,21 +53,22 @@ inline const Real kSoundSpeed = 10.0 * kCharacteristicVelocity;
 //	Validation parameters.
 //----------------------------------------------------------------------
 inline constexpr Real kPreEntryClearanceForStats = 4.0 * kParticleSpacing;
-inline constexpr Real kPostEntryDepthForStats = 0.5 * kParticleSpacing;
+inline constexpr Real kPostEntryDepthForStats = 0.0;
 inline constexpr Real kCenterErrorTolerance = 1.0e-10;
 inline constexpr Real kPreEntryForceNormTolerance = 1.0e-3;
-inline constexpr Real kMinimumPostEntryFz = 1.0e-2;
+inline constexpr Real kMinimumPostEntryFy = 1.0e-2;
 inline constexpr Real kMinimumTrajectoryDifference = 1.0e-5;
-inline const std::string kRelaxedSphereReloadBodyName = "FixedSphereBoundary";
+inline constexpr Real kMassRelativeTolerance = 1.0e-12;
+inline constexpr Real kMinimumFinalTopSubmergence = 2.0 * kParticleSpacing;
+inline const std::string kRelaxedCylinderReloadBodyName = "LammpsTwoWayWaterEntryCylinder";
 //----------------------------------------------------------------------
 //	Geometric shapes used in this case.
 //----------------------------------------------------------------------
-inline const Vec3d kInitialCenter(0.5 * kTankLengthX,
-                                  0.5 * kTankLengthY,
-                                  kWaterHeight + kSphereRadius + kInitialClearance);
+inline const Vec2d kInitialCenter(0.5 * kTankLengthX,
+                                  kWaterHeight + kCylinderRadius + kInitialClearance);
 inline const BoundingBoxd kSystemDomainBounds(
-    Vec3d(-kBoundaryWidth, -kBoundaryWidth, -kBoundaryWidth),
-    Vec3d(kTankLengthX + kBoundaryWidth, kTankLengthY + kBoundaryWidth, kTankHeightZ + kBoundaryWidth));
+    Vec2d(-kBoundaryWidth, -kBoundaryWidth),
+    Vec2d(kTankLengthX + kBoundaryWidth, kTankHeightY + kBoundaryWidth));
 
 class WaterBlock : public ComplexShape
 {
@@ -76,8 +76,8 @@ class WaterBlock : public ComplexShape
     explicit WaterBlock(const std::string &shape_name) : ComplexShape(shape_name)
     {
         add<GeometricShapeBox>(
-            Transform(Vec3d(0.5 * kTankLengthX, 0.5 * kTankLengthY, 0.5 * kWaterHeight)),
-            Vec3d(0.5 * kTankLengthX, 0.5 * kTankLengthY, 0.5 * kWaterHeight),
+            Transform(Vec2d(0.5 * kTankLengthX, 0.5 * kWaterHeight)),
+            Vec2d(0.5 * kTankLengthX, 0.5 * kWaterHeight),
             "WaterBox");
     }
 };
@@ -88,17 +88,24 @@ class WallBoundary : public ComplexShape
     explicit WallBoundary(const std::string &shape_name) : ComplexShape(shape_name)
     {
         add<GeometricShapeBox>(
-            Transform(Vec3d(0.5 * kTankLengthX, 0.5 * kTankLengthY, 0.5 * kTankHeightZ)),
-            Vec3d(0.5 * kTankLengthX + kBoundaryWidth,
-                  0.5 * kTankLengthY + kBoundaryWidth,
-                  0.5 * kTankHeightZ + kBoundaryWidth),
+            Transform(Vec2d(0.5 * kTankLengthX, 0.5 * kTankHeightY)),
+            Vec2d(0.5 * kTankLengthX + kBoundaryWidth,
+                  0.5 * kTankHeightY + kBoundaryWidth),
             "OuterTank");
         subtract<GeometricShapeBox>(
-            Transform(Vec3d(0.5 * kTankLengthX, 0.5 * kTankLengthY, 0.5 * kTankHeightZ + kBoundaryWidth)),
-            Vec3d(0.5 * kTankLengthX,
-                  0.5 * kTankLengthY,
-                  0.5 * kTankHeightZ + kBoundaryWidth),
+            Transform(Vec2d(0.5 * kTankLengthX, 0.5 * kTankHeightY + kBoundaryWidth)),
+            Vec2d(0.5 * kTankLengthX,
+                  0.5 * kTankHeightY + kBoundaryWidth),
             "InnerTankVoid");
+    }
+};
+
+class CylinderBoundaryShape : public MultiPolygonShape
+{
+  public:
+    explicit CylinderBoundaryShape(const std::string &shape_name) : MultiPolygonShape(shape_name)
+    {
+        multi_polygon_.addCircle(kInitialCenter, kCylinderRadius, 100, GeometricOps::add);
     }
 };
 //----------------------------------------------------------------------
@@ -115,7 +122,7 @@ class HydrostaticPressureField : public fluid_dynamics::FluidInitialCondition
 
     void update(size_t index_i, Real = 0.0)
     {
-        const Real pressure = kWaterDensity * kGravity * SMAX(Real(0), kWaterHeight - pos_[index_i][2]);
+        const Real pressure = kWaterDensity * kGravity * SMAX(Real(0), kWaterHeight - pos_[index_i][1]);
         pressure_[index_i] = pressure;
         rho_[index_i] = kWaterDensity + pressure / (kSoundSpeed * kSoundSpeed);
         mass_[index_i] = rho_[index_i] * particles_->ParticleVolume(index_i);
@@ -128,7 +135,8 @@ class HydrostaticPressureField : public fluid_dynamics::FluidInitialCondition
     Real *pressure_;
 };
 //----------------------------------------------------------------------
-//	LAMMPS one-particle DEM adapter.
+//	LAMMPS one-disc DEM adapter. LAMMPS remains 3-component internally,
+//	but this example maps SPHinXsys (x, y) to LAMMPS (x, y, z = 0).
 //----------------------------------------------------------------------
 struct ExternalForce
 {
@@ -139,10 +147,36 @@ struct ExternalForce
 
 struct DEMState
 {
-    Vec3d center = Vec3d::Zero();
-    Vec3d velocity = Vec3d::Zero();
-    Vec3d omega = Vec3d::Zero();
+    Vec2d center = Vec2d::Zero();
+    Vec2d velocity = Vec2d::Zero();
+    Vec2d acceleration = Vec2d::Zero();
+    Real omega_z = 0.0;
 };
+
+inline Real cylinder_area()
+{
+    return Pi * kCylinderRadius * kCylinderRadius;
+}
+
+inline Real cylinder_mass()
+{
+    return kCylinderDensity * cylinder_area();
+}
+
+inline Real cylinder_weight()
+{
+    return cylinder_mass() * kGravity;
+}
+
+inline Real lammps_sphere_volume()
+{
+    return (4.0 / 3.0) * Pi * kCylinderRadius * kCylinderRadius * kCylinderRadius;
+}
+
+inline Real lammps_equivalent_sphere_density()
+{
+    return cylinder_mass() / lammps_sphere_volume();
+}
 
 #if defined(LAMMPS_BIGBIG)
 using tagint_c = int64_t;
@@ -170,15 +204,15 @@ extern "C" void external_force_callback(void *ptr,
         {
             fexternal[i][0] = external->force[0];
             fexternal[i][1] = external->force[1];
-            fexternal[i][2] = external->force[2];
+            fexternal[i][2] = 0.0;
             ++external->atom1_updates;
         }
     }
 }
 
-inline Vec3d to_vec3d(const std::array<double, 3> &values)
+inline Vec2d to_vec2d(const std::array<double, 3> &values)
 {
-    return Vec3d(values[0], values[1], values[2]);
+    return Vec2d(values[0], values[1]);
 }
 
 class LammpsInstance
@@ -249,29 +283,29 @@ class LammpsDEMAdapter
     {
         std::ostringstream cmds;
         cmds << std::setprecision(17)
+             << "dimension 2\n"
              << "units si\n"
              << "atom_style sphere\n"
              << "atom_modify map array\n"
-             << "boundary f f f\n"
+             << "boundary f f p\n"
              << "newton off\n"
              << "comm_modify vel yes\n"
              << "region box block -0.02 " << kTankLengthX + 0.02
-             << " -0.02 " << kTankLengthY + 0.02
-             << " -0.05 " << kTankHeightZ + 0.08 << " units box\n"
+             << " -0.05 " << kTankHeightY + 0.08
+             << " -0.001 0.001 units box\n"
              << "create_box 1 box\n"
              << "create_atoms 1 single "
              << kInitialCenter[0] << ' '
-             << kInitialCenter[1] << ' '
-             << kInitialCenter[2] << " units box\n"
-             << "set atom 1 diameter " << kSphereDiameter
-             << " density " << kSphereDensity << "\n"
+             << kInitialCenter[1] << " 0.0 units box\n"
+             << "set atom 1 diameter " << kCylinderDiameter
+             << " density " << lammps_equivalent_sphere_density() << "\n"
              << "velocity all set 0.0 0.0 0.0 units box\n"
              << "pair_style zero 0.1\n"
              << "pair_coeff * *\n"
              << "neighbor 0.01 bin\n"
              << "neigh_modify delay 0 every 1 check yes\n"
              << "fix int all nve/sphere\n"
-             << "fix grav all gravity " << kGravity << " vector 0.0 0.0 -1.0\n"
+             << "fix grav all gravity " << kGravity << " vector 0.0 -1.0 0.0\n"
              << "fix ext all external pf/callback 1 1\n"
              << "timestep " << kDemMaxDt << "\n"
              << "thermo 1000000\n";
@@ -297,8 +331,7 @@ class LammpsDEMAdapter
         lammps_.command(cmd.str(), "LAMMPS timestep update");
     }
 
-    // Synchronize LAMMPS to one SPH acoustic step. Most DEM substeps use
-    // kDemMaxDt, and a final short step removes the remaining time mismatch.
+    // Keep LAMMPS and SPHinXsys synchronized over one SPH acoustic step.
     int runForDuration(Real acoustic_step)
     {
         if (acoustic_step <= TinyReal)
@@ -310,7 +343,6 @@ class LammpsDEMAdapter
         const Real remainder = acoustic_step - static_cast<Real>(full_steps) * kDemMaxDt;
         int executed_steps = 0;
 
-        // Run most of the acoustic interval with the nominal DEM timestep.
         if (full_steps > 0)
         {
             setTimestep(kDemMaxDt);
@@ -318,7 +350,6 @@ class LammpsDEMAdapter
             executed_steps += full_steps;
         }
 
-        // Use one short tail step so the LAMMPS time exactly matches the SPH acoustic step.
         if (remainder > TinyReal)
         {
             setTimestep(remainder);
@@ -330,12 +361,23 @@ class LammpsDEMAdapter
         return executed_steps;
     }
 
-    void setExternalForce(const Vec3d &force)
+    void setExternalForce(const Vec2d &force)
     {
-        // This value is consumed by fix external pf/callback during LAMMPS run.
+        // This is the hydrodynamic force only. LAMMPS supplies gravity through fix gravity.
         external_force_.force[0] = force[0];
         external_force_.force[1] = force[1];
-        external_force_.force[2] = force[2];
+        external_force_.force[2] = 0.0;
+    }
+
+    Real particleMass() const
+    {
+        auto *rmass = static_cast<double *>(lammps_extract_atom(lammps_.get(), "rmass"));
+        lammps_.throw_if_error("extract atom rmass");
+        if (rmass == nullptr)
+        {
+            throw std::runtime_error("lammps_extract_atom returned null for rmass");
+        }
+        return static_cast<Real>(rmass[0]);
     }
 
     DEMState pullState() const
@@ -351,7 +393,11 @@ class LammpsDEMAdapter
         lammps_gather_atoms(lammps_.get(), "omega", 1, 3, omega.data());
         lammps_.throw_if_error("gather atom angular velocities");
 
-        return DEMState{to_vec3d(x), to_vec3d(v), to_vec3d(omega)};
+        const Vec2d acceleration(
+            external_force_.force[0] / cylinder_mass(),
+            external_force_.force[1] / cylinder_mass() - kGravity);
+
+        return DEMState{to_vec2d(x), to_vec2d(v), acceleration, static_cast<Real>(omega[2])};
     }
 
     int version() const { return lammps_.version(); }
@@ -363,23 +409,24 @@ class LammpsDEMAdapter
     ExternalForce external_force_;
 };
 //----------------------------------------------------------------------
-//	two-way moving boundary driven by the LAMMPS particle state.
+//	Two-way moving boundary driven by the LAMMPS disc state.
 //----------------------------------------------------------------------
-class DrivenSphereBoundary
+class DrivenCylinderBoundary
 {
   public:
-    DrivenSphereBoundary(SolidBody &sphere_body, const Vec3d &initial_center)
-        : sphere_body_(sphere_body), particles_(sphere_body.getBaseParticles()),
+    DrivenCylinderBoundary(SolidBody &cylinder_body, const Vec2d &initial_center)
+        : cylinder_body_(cylinder_body), particles_(cylinder_body.getBaseParticles()),
           pos_(particles_.ParticlePositions()),
           vel_(particles_.registerStateVariableData<Vecd>("Velocity")),
+          acc_(particles_.registerStateVariableData<Vecd>("Acceleration")),
           initial_center_(initial_center)
     {
         if (particles_.TotalRealParticles() == 0)
         {
-            throw std::runtime_error("SPHinXsys sphere body generated zero particles");
+            throw std::runtime_error("SPHinXsys cylinder body generated zero particles");
         }
 
-        const Vec3d centroid_offset = initial_center_ - geometricCenter();
+        const Vec2d centroid_offset = initial_center_ - geometricCenter();
         for (UnsignedInt i = 0; i != particles_.TotalRealParticles(); ++i)
         {
             pos_[i] += centroid_offset;
@@ -389,7 +436,8 @@ class DrivenSphereBoundary
         for (UnsignedInt i = 0; i != particles_.TotalRealParticles(); ++i)
         {
             relative_positions_.push_back(pos_[i] - initial_center_);
-            vel_[i] = Vec3d::Zero();
+            vel_[i] = Vec2d::Zero();
+            acc_[i] = Vec2d::Zero();
         }
     }
 
@@ -399,13 +447,14 @@ class DrivenSphereBoundary
         {
             pos_[i] = state.center + relative_positions_[i];
             vel_[i] = state.velocity;
+            acc_[i] = state.acceleration;
         }
-        sphere_body_.setNewlyUpdated();
+        cylinder_body_.setNewlyUpdated();
     }
 
-    Vec3d geometricCenter() const
+    Vec2d geometricCenter() const
     {
-        Vec3d center = Vec3d::Zero();
+        Vec2d center = Vec2d::Zero();
         for (UnsignedInt i = 0; i != particles_.TotalRealParticles(); ++i)
         {
             center += pos_[i];
@@ -416,12 +465,13 @@ class DrivenSphereBoundary
     UnsignedInt particleCount() const { return particles_.TotalRealParticles(); }
 
   private:
-    SolidBody &sphere_body_;
+    SolidBody &cylinder_body_;
     BaseParticles &particles_;
     Vecd *pos_;
     Vecd *vel_;
-    Vec3d initial_center_;
-    std::vector<Vec3d> relative_positions_;
+    Vecd *acc_;
+    Vec2d initial_center_;
+    std::vector<Vec2d> relative_positions_;
 };
 //----------------------------------------------------------------------
 //	Diagnostics and small case-local utilities.
@@ -432,23 +482,23 @@ struct MotionSample
     int lammps_step = 0;
     Real time = 0.0;
     DEMState dem_state;
-    Vec3d sph_geometric_center = Vec3d::Zero();
+    Vec2d sph_geometric_center = Vec2d::Zero();
     Real center_error = 0.0;
-    Real z_freefall = 0.0;
-    Real vz_freefall = 0.0;
-    Real z_minus_freefall = 0.0;
-    Real vz_minus_freefall = 0.0;
+    Real y_freefall = 0.0;
+    Real vy_freefall = 0.0;
+    Real y_minus_freefall = 0.0;
+    Real vy_minus_freefall = 0.0;
 };
 
 struct ForceSample
 {
     int number_of_iterations = 0;
     Real time = 0.0;
-    Vec3d raw_force = Vec3d::Zero();
-    Vec3d applied_force = Vec3d::Zero();
+    Vec2d raw_force = Vec2d::Zero();
+    Vec2d applied_force = Vec2d::Zero();
     Real raw_force_norm = 0.0;
     Real applied_force_norm = 0.0;
-    Real sphere_bottom_z = 0.0;
+    Real cylinder_bottom_y = 0.0;
     bool pre_entry_stat = false;
     bool post_entry_stat = false;
     bool capped = false;
@@ -456,11 +506,11 @@ struct ForceSample
 
 struct ForceStats
 {
-    Vec3d pre_entry_sum = Vec3d::Zero();
+    Vec2d pre_entry_sum = Vec2d::Zero();
     Real pre_entry_norm_sum = 0.0;
     int pre_entry_count = 0;
-    Real max_raw_fz = -std::numeric_limits<Real>::max();
-    Real max_applied_fz = -std::numeric_limits<Real>::max();
+    Real max_raw_fy = -std::numeric_limits<Real>::max();
+    Real max_applied_fy = -std::numeric_limits<Real>::max();
     int post_entry_count = 0;
     int cap_count = 0;
 
@@ -474,8 +524,8 @@ struct ForceStats
         }
         if (sample.post_entry_stat)
         {
-            max_raw_fz = std::max(max_raw_fz, sample.raw_force[2]);
-            max_applied_fz = std::max(max_applied_fz, sample.applied_force[2]);
+            max_raw_fy = std::max(max_raw_fy, sample.raw_force[1]);
+            max_applied_fy = std::max(max_applied_fy, sample.applied_force[1]);
             ++post_entry_count;
         }
         if (sample.capped)
@@ -484,11 +534,11 @@ struct ForceStats
         }
     }
 
-    Vec3d pre_entry_mean_force() const
+    Vec2d pre_entry_mean_force() const
     {
         if (pre_entry_count == 0)
         {
-            return Vec3d::Zero();
+            return Vec2d::Zero();
         }
         return pre_entry_sum / static_cast<Real>(pre_entry_count);
     }
@@ -513,81 +563,44 @@ inline bool reload_particle_file_exists()
     return std::filesystem::exists(reload_particle_file());
 }
 
-inline std::filesystem::path fixed_sphere_reload_file()
-{
-    return std::filesystem::current_path().parent_path().parent_path() /
-           "test_3d_fixed_sphere_hydro_force" / "bin" / "reload" / "Reload.xml";
-}
-
-inline void import_fixed_sphere_reload_if_available()
-{
-    const std::filesystem::path local_reload = reload_particle_file();
-    if (std::filesystem::exists(local_reload))
-    {
-        return;
-    }
-
-    const std::filesystem::path fixed_reload = fixed_sphere_reload_file();
-    if (!std::filesystem::exists(fixed_reload))
-    {
-        return;
-    }
-
-    std::filesystem::create_directories(local_reload.parent_path());
-    std::filesystem::copy_file(fixed_reload, local_reload, std::filesystem::copy_options::overwrite_existing);
-}
-
-inline Real sphere_volume()
-{
-    return (4.0 / 3.0) * Pi * kSphereRadius * kSphereRadius * kSphereRadius;
-}
-
-inline Real sphere_mass()
-{
-    return kSphereDensity * sphere_volume();
-}
-
-inline Real sphere_weight()
-{
-    return sphere_mass() * kGravity;
-}
-
 inline Real water_entry_time()
 {
     return std::sqrt(2.0 * kInitialClearance / kGravity);
 }
 
-inline bool is_finite(const Vec3d &value)
+inline bool is_finite(const Vec2d &value)
 {
-    return std::isfinite(value[0]) && std::isfinite(value[1]) && std::isfinite(value[2]);
+    return std::isfinite(value[0]) && std::isfinite(value[1]);
 }
 
-inline std::string generate_sphere_boundary_particles(SPHSystem &sph_system, SolidBody &sphere_boundary)
+inline std::string generate_cylinder_boundary_particles(SPHSystem &sph_system, SolidBody &cylinder_boundary)
 {
+    cylinder_boundary.defineAdaptationRatios(1.15, 1.0);
+    cylinder_boundary.defineBodyLevelSetShape().writeLevelSet();
+
     if (!sph_system.RunParticleRelaxation() && sph_system.ReloadParticles() && reload_particle_file_exists())
     {
-        sphere_boundary.generateParticles<BaseParticles, Reload>(kRelaxedSphereReloadBodyName);
+        cylinder_boundary.generateParticles<BaseParticles, Reload>(kRelaxedCylinderReloadBodyName);
         return "Reload";
     }
 
-    sphere_boundary.defineBodyLevelSetShape().writeLevelSet();
-    sphere_boundary.generateParticles<BaseParticles, Lattice>();
+    cylinder_boundary.generateParticles<BaseParticles, Lattice>();
     return "Lattice";
 }
 
-inline int run_sphere_particle_relaxation(SolidBody &sphere_boundary)
+inline int run_cylinder_particle_relaxation(SolidBody &cylinder_boundary)
 {
-    InnerRelation sphere_inner(sphere_boundary);
+    InnerRelation cylinder_inner(cylinder_boundary);
 
     using namespace relax_dynamics;
-    SimpleDynamics<RandomizeParticlePosition> random_sphere_particles(sphere_boundary);
-    RelaxationStepInner relaxation_step_inner(sphere_inner);
-    BodyStatesRecordingToVtp write_sphere_state(sphere_boundary);
-    ReloadParticleIO write_particle_reload_files(sphere_boundary, kRelaxedSphereReloadBodyName);
+    SimpleDynamics<RandomizeParticlePosition> random_cylinder_particles(cylinder_boundary);
+    RelaxationStepInner relaxation_step_inner(cylinder_inner);
+    BodyStatesRecordingToVtp write_cylinder_state(cylinder_boundary);
+    ReloadParticleIO write_particle_reload_files(cylinder_boundary, kRelaxedCylinderReloadBodyName);
 
-    random_sphere_particles.exec(0.25);
+    random_cylinder_particles.exec(0.25);
     relaxation_step_inner.SurfaceBounding().exec();
-    write_sphere_state.writeToFile(0);
+    write_cylinder_state.writeToFile(0);
 
     int ite_p = 0;
     while (ite_p < kRelaxationSteps)
@@ -597,9 +610,9 @@ inline int run_sphere_particle_relaxation(SolidBody &sphere_boundary)
         if (ite_p % kRelaxationOutputInterval == 0)
         {
             std::cout << std::fixed << std::setprecision(9)
-                      << "Relaxation steps for the LAMMPS-driven sphere boundary N = "
+                      << "Relaxation steps for the LAMMPS-driven cylinder boundary N = "
                       << ite_p << "\n";
-            write_sphere_state.writeToFile(ite_p);
+            write_cylinder_state.writeToFile(ite_p);
         }
     }
 
@@ -611,56 +624,56 @@ inline int run_sphere_particle_relaxation(SolidBody &sphere_boundary)
     }
 
     std::cout << std::setprecision(17);
-    std::cout << "SPHinXsys LAMMPS two-way water-entry sphere particle relaxation\n";
-    std::cout << "sphere_particles: " << sphere_boundary.getBaseParticles().TotalRealParticles() << '\n';
+    std::cout << "SPHinXsys 2D LAMMPS two-way water-entry cylinder particle relaxation\n";
+    std::cout << "cylinder_particles: " << cylinder_boundary.getBaseParticles().TotalRealParticles() << '\n';
     std::cout << "particle_spacing_m: " << kParticleSpacing << '\n';
     std::cout << "relaxation_steps: " << kRelaxationSteps << '\n';
-    std::cout << "reload_body_name: " << kRelaxedSphereReloadBodyName << '\n';
+    std::cout << "reload_body_name: " << kRelaxedCylinderReloadBodyName << '\n';
     std::cout << "reload_file: " << std::filesystem::absolute(reload_path).string() << '\n';
     std::cout << "VTP_output_folder: " << std::filesystem::absolute(IO::getEnvironment().OutputFolder()).string() << '\n';
     std::cout << "status: RELAXATION_PASS\n";
     return 0;
 }
 
-inline void update_water_sphere_configuration(FluidBody &water_block,
-                                              SolidBody &sphere_boundary,
-                                              ComplexRelation &water_complex,
-                                              ContactRelation &sphere_contact)
+inline void update_water_cylinder_configuration(FluidBody &water_block,
+                                                SolidBody &cylinder_boundary,
+                                                ComplexRelation &water_complex,
+                                                ContactRelation &cylinder_contact)
 {
     water_block.updateCellLinkedList();
-    sphere_boundary.updateCellLinkedList();
+    cylinder_boundary.updateCellLinkedList();
     water_complex.updateConfiguration();
-    sphere_contact.updateConfiguration();
+    cylinder_contact.updateConfiguration();
 }
 
-inline Vec3d sum_sphere_hydro_force(SPHBody &sphere)
+inline Vec2d sum_cylinder_hydro_force(SPHBody &cylinder)
 {
-    BaseParticles &particles = sphere.getBaseParticles();
+    BaseParticles &particles = cylinder.getBaseParticles();
     Vecd *pressure_force = particles.getVariableDataByName<Vecd>("PressureForceFromFluid");
     Vecd *viscous_force = particles.getVariableDataByName<Vecd>("ViscousForceFromFluid");
 
-    Vec3d total = Vec3d::Zero();
+    Vec2d total = Vec2d::Zero();
     for (UnsignedInt i = 0; i != particles.TotalRealParticles(); ++i)
     {
         const Vecd particle_force = pressure_force[i] + viscous_force[i];
-        total += Vec3d(particle_force[0], particle_force[1], particle_force[2]);
+        total += Vec2d(particle_force[0], particle_force[1]);
     }
     return total;
 }
 
 struct ForceApplication
 {
-    Vec3d applied_force = Vec3d::Zero();
+    Vec2d applied_force = Vec2d::Zero();
     bool capped = false;
 };
 
-inline ForceApplication relax_and_cap_force(const Vec3d &raw_force, const Vec3d &previous_applied_force)
+inline ForceApplication relax_and_cap_force(const Vec2d &raw_force, const Vec2d &previous_applied_force)
 {
     ForceApplication result;
-    Vec3d relaxed_force =
+    Vec2d relaxed_force =
         kForceRelaxationAlpha * raw_force + (1.0 - kForceRelaxationAlpha) * previous_applied_force;
 
-    const Real cap = kForceCapWeightFactor * sphere_weight();
+    const Real cap = kForceCapWeightFactor * cylinder_weight();
     const Real relaxed_norm = relaxed_force.norm();
     if (relaxed_norm > cap && relaxed_norm > TinyReal)
     {
@@ -676,7 +689,7 @@ inline MotionSample make_motion_sample(int number_of_iterations,
                                        int lammps_step,
                                        Real time,
                                        const DEMState &dem_state,
-                                       const Vec3d &sph_geometric_center)
+                                       const Vec2d &sph_geometric_center)
 {
     MotionSample sample;
     sample.number_of_iterations = number_of_iterations;
@@ -685,18 +698,18 @@ inline MotionSample make_motion_sample(int number_of_iterations,
     sample.dem_state = dem_state;
     sample.sph_geometric_center = sph_geometric_center;
     sample.center_error = (sph_geometric_center - dem_state.center).norm();
-    sample.z_freefall = kInitialCenter[2] - 0.5 * kGravity * sample.time * sample.time;
-    sample.vz_freefall = -kGravity * sample.time;
-    sample.z_minus_freefall = dem_state.center[2] - sample.z_freefall;
-    sample.vz_minus_freefall = dem_state.velocity[2] - sample.vz_freefall;
+    sample.y_freefall = kInitialCenter[1] - 0.5 * kGravity * sample.time * sample.time;
+    sample.vy_freefall = -kGravity * sample.time;
+    sample.y_minus_freefall = dem_state.center[1] - sample.y_freefall;
+    sample.vy_minus_freefall = dem_state.velocity[1] - sample.vy_freefall;
     return sample;
 }
 
 inline ForceSample make_force_sample(int number_of_iterations,
                                      Real time,
                                      const DEMState &dem_state,
-                                     const Vec3d &raw_force,
-                                     const Vec3d &applied_force,
+                                     const Vec2d &raw_force,
+                                     const Vec2d &applied_force,
                                      bool capped)
 {
     ForceSample sample;
@@ -706,9 +719,9 @@ inline ForceSample make_force_sample(int number_of_iterations,
     sample.applied_force = applied_force;
     sample.raw_force_norm = raw_force.norm();
     sample.applied_force_norm = applied_force.norm();
-    sample.sphere_bottom_z = dem_state.center[2] - kSphereRadius;
-    sample.pre_entry_stat = sample.sphere_bottom_z > kWaterHeight + kPreEntryClearanceForStats;
-    sample.post_entry_stat = sample.sphere_bottom_z < kWaterHeight - kPostEntryDepthForStats;
+    sample.cylinder_bottom_y = dem_state.center[1] - kCylinderRadius;
+    sample.pre_entry_stat = sample.cylinder_bottom_y > kWaterHeight + kPreEntryClearanceForStats;
+    sample.post_entry_stat = sample.cylinder_bottom_y < kWaterHeight - kPostEntryDepthForStats;
     sample.capped = capped;
     return sample;
 }
@@ -716,11 +729,10 @@ inline ForceSample make_force_sample(int number_of_iterations,
 inline void write_motion_csv_header(std::ofstream &csv)
 {
     csv << "number_of_iterations,lammps_step,time_s,"
-           "lammps_x_m,lammps_y_m,lammps_z_m,"
-           "lammps_vx_m_per_s,lammps_vy_m_per_s,lammps_vz_m_per_s,"
-           "lammps_omega_x_rad_per_s,lammps_omega_y_rad_per_s,lammps_omega_z_rad_per_s,"
-           "sph_center_x_m,sph_center_y_m,sph_center_z_m,"
-           "center_error_m,z_freefall_m,vz_freefall_m_per_s,z_minus_freefall_m,vz_minus_freefall_m_per_s\n";
+           "lammps_x_m,lammps_y_m,lammps_vx_m_per_s,lammps_vy_m_per_s,"
+           "lammps_ax_m_per_s2,lammps_ay_m_per_s2,lammps_omega_z_rad_per_s,"
+           "sph_center_x_m,sph_center_y_m,center_error_m,"
+           "y_freefall_m,vy_freefall_m_per_s,y_minus_freefall_m,vy_minus_freefall_m_per_s\n";
 }
 
 inline void write_motion_csv_sample(std::ofstream &csv, const MotionSample &sample)
@@ -730,51 +742,46 @@ inline void write_motion_csv_sample(std::ofstream &csv, const MotionSample &samp
         << sample.time << ','
         << sample.dem_state.center[0] << ','
         << sample.dem_state.center[1] << ','
-        << sample.dem_state.center[2] << ','
         << sample.dem_state.velocity[0] << ','
         << sample.dem_state.velocity[1] << ','
-        << sample.dem_state.velocity[2] << ','
-        << sample.dem_state.omega[0] << ','
-        << sample.dem_state.omega[1] << ','
-        << sample.dem_state.omega[2] << ','
+        << sample.dem_state.acceleration[0] << ','
+        << sample.dem_state.acceleration[1] << ','
+        << sample.dem_state.omega_z << ','
         << sample.sph_geometric_center[0] << ','
         << sample.sph_geometric_center[1] << ','
-        << sample.sph_geometric_center[2] << ','
         << sample.center_error << ','
-        << sample.z_freefall << ','
-        << sample.vz_freefall << ','
-        << sample.z_minus_freefall << ','
-        << sample.vz_minus_freefall << '\n';
+        << sample.y_freefall << ','
+        << sample.vy_freefall << ','
+        << sample.y_minus_freefall << ','
+        << sample.vy_minus_freefall << '\n';
 }
 
 inline void write_force_csv_header(std::ofstream &csv)
 {
     csv << "number_of_iterations,time_s,"
-           "Fx_raw_N,Fy_raw_N,Fz_raw_N,raw_force_norm_N,"
-           "Fx_applied_N,Fy_applied_N,Fz_applied_N,applied_force_norm_N,"
-           "sphere_weight_N,force_cap_N,capped,"
-           "sphere_bottom_z_m,geometric_entry,pre_entry_stat,post_entry_stat\n";
+           "Fx_raw_N,Fy_raw_N,raw_force_norm_N,"
+           "Fx_applied_N,Fy_applied_N,applied_force_norm_N,"
+           "cylinder_weight_N,force_cap_N,capped,"
+           "cylinder_bottom_y_m,geometric_entry,pre_entry_stat,post_entry_stat\n";
 }
 
 inline void write_force_csv_sample(std::ofstream &csv, const ForceSample &sample)
 {
-    const bool geometric_entry = sample.sphere_bottom_z <= kWaterHeight;
+    const bool geometric_entry = sample.cylinder_bottom_y <= kWaterHeight;
     csv << sample.number_of_iterations << ','
         << sample.time << ','
         << sample.raw_force[0] << ','
         << sample.raw_force[1] << ','
-        << sample.raw_force[2] << ','
         << sample.raw_force_norm << ','
         << sample.applied_force[0] << ','
         << sample.applied_force[1] << ','
-        << sample.applied_force[2] << ','
         << sample.applied_force_norm << ','
-        << sphere_weight() << ','
-        << kForceCapWeightFactor * sphere_weight() << ','
+        << cylinder_weight() << ','
+        << kForceCapWeightFactor * cylinder_weight() << ','
         << (sample.capped ? 1 : 0) << ','
-        << sample.sphere_bottom_z << ','
+        << sample.cylinder_bottom_y << ','
         << (geometric_entry ? 1 : 0) << ','
         << (sample.pre_entry_stat ? 1 : 0) << ','
         << (sample.post_entry_stat ? 1 : 0) << '\n';
 }
-} // namespace LammpsTwoWayWaterEntry
+} // namespace LammpsTwoWayWaterEntry2D
