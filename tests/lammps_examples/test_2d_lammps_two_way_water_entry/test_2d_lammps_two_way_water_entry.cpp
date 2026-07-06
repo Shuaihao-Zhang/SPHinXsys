@@ -126,6 +126,23 @@ int main(int ac, char *av[])
         const std::filesystem::path force_csv_path = "cylinder_force.csv";
         const std::filesystem::path dll_path = "liblammps.dll";
         const std::filesystem::path output_path = std::filesystem::absolute(IO::getEnvironment().OutputFolder());
+        auto output_file_exists_with_prefix = [](const std::filesystem::path &folder,
+                                                 const std::string &prefix) -> bool
+        {
+            if (!std::filesystem::exists(folder))
+            {
+                return false;
+            }
+            for (const auto &entry : std::filesystem::directory_iterator(folder))
+            {
+                if (entry.is_regular_file() &&
+                    entry.path().filename().string().rfind(prefix, 0) == 0)
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
 
         std::ofstream motion_csv(motion_csv_path);
         std::ofstream force_csv(force_csv_path);
@@ -161,6 +178,7 @@ int main(int ac, char *av[])
         Real max_center_error = 0.0;
         Real max_abs_y_minus_freefall = 0.0;
         Real max_abs_vy_minus_freefall = 0.0;
+        Real max_bottom_contact_overlap = 0.0;
         bool finite_state = true;
         ForceStats force_stats;
         MotionSample final_motion_sample;
@@ -179,10 +197,17 @@ int main(int ac, char *av[])
         write_motion_csv_sample(motion_csv, final_motion_sample);
         write_force_csv_sample(force_csv, force_sample);
         max_center_error = std::max(max_center_error, final_motion_sample.center_error);
+        max_bottom_contact_overlap =
+            std::max(max_bottom_contact_overlap, bottom_wall_overlap(dem_state.center));
         force_stats.add(force_sample);
         finite_state = finite_state && is_finite(dem_state.center) && is_finite(dem_state.velocity) &&
                        is_finite(raw_force) && is_finite(previous_applied_force);
         write_real_body_states.writeToFile(0);
+        std::filesystem::path latest_dem_cylinder_vtp =
+            write_dem_cylinder_to_vtp(0, physical_time, dem_state.center, kCylinderRadius);
+        std::filesystem::path latest_dem_force_vtp =
+            write_dem_force_to_vtp(0, physical_time, dem_state, raw_force, previous_applied_force);
+        int dem_visualization_output_count = 1;
 
         //----------------------------------------------------------------------
         //	Main loop starts here. The outer loop follows the fluid advection
@@ -239,6 +264,8 @@ int main(int ac, char *av[])
                 write_force_csv_sample(force_csv, force_sample);
 
                 max_center_error = std::max(max_center_error, final_motion_sample.center_error);
+                max_bottom_contact_overlap =
+                    std::max(max_bottom_contact_overlap, bottom_wall_overlap(dem_state.center));
                 max_abs_y_minus_freefall =
                     std::max(max_abs_y_minus_freefall, std::abs(final_motion_sample.y_minus_freefall));
                 max_abs_vy_minus_freefall =
@@ -265,6 +292,11 @@ int main(int ac, char *av[])
                 {
                     output_iteration = number_of_iterations;
                     write_real_body_states.writeToFile(output_iteration);
+                    latest_dem_cylinder_vtp =
+                        write_dem_cylinder_to_vtp(output_iteration, physical_time, dem_state.center, kCylinderRadius);
+                    latest_dem_force_vtp =
+                        write_dem_force_to_vtp(output_iteration, physical_time, dem_state, raw_force, previous_applied_force);
+                    ++dem_visualization_output_count;
                     next_output_time += kVtpOutputInterval;
                 }
             }
@@ -300,6 +332,7 @@ int main(int ac, char *av[])
         const Real final_cylinder_top_y = final_y_two_way + kCylinderRadius;
         const Real final_cylinder_bottom_y = final_y_two_way - kCylinderRadius;
         const Real final_top_submergence = kWaterHeight - final_cylinder_top_y;
+        const Real final_bottom_contact_overlap = bottom_wall_overlap(final_motion_sample.dem_state.center);
         const TickCount::interval_t tt = t4 - t1 - interval;
 
         std::cout << std::setprecision(17);
@@ -310,6 +343,9 @@ int main(int ac, char *av[])
         std::cout << "cylinder_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
         std::cout << "cylinder_force_csv: " << std::filesystem::absolute(force_csv_path).string() << '\n';
         std::cout << "VTP_output_folder: " << output_path.string() << '\n';
+        std::cout << "DEM_cylinder_vtp_latest: " << std::filesystem::absolute(latest_dem_cylinder_vtp).string() << '\n';
+        std::cout << "DEM_force_vtp_latest: " << std::filesystem::absolute(latest_dem_force_vtp).string() << '\n';
+        std::cout << "DEM_visualization_output_count: " << dem_visualization_output_count << '\n';
         std::cout << "reload_file: " << std::filesystem::absolute(reload_particle_file()).string() << '\n';
         std::cout << "cylinder_particle_source: " << cylinder_particle_source << '\n';
         std::cout << "water_particles: " << water_block.getBaseParticles().TotalRealParticles() << '\n';
@@ -319,6 +355,10 @@ int main(int ac, char *av[])
         std::cout << "lammps_particle_mass_kg: " << lammps_particle_mass << '\n';
         std::cout << "lammps_particle_mass_relative_error: " << lammps_mass_relative_error << '\n';
         std::cout << "cylinder_weight_per_unit_depth_N_per_m: " << cylinder_weight() << '\n';
+        std::cout << "bottom_wall_y_m: " << kBottomWallY << '\n';
+        std::cout << "contact_normal_stiffness_N_per_m: " << kContactNormalStiffness << '\n';
+        std::cout << "contact_restitution: " << kContactRestitution << '\n';
+        std::cout << "contact_friction: " << kContactFriction << '\n';
         std::cout << "force_relaxation_alpha: " << kForceRelaxationAlpha << '\n';
         std::cout << "force_cap_N_per_m: " << kForceCapWeightFactor * cylinder_weight() << '\n';
         std::cout << "force_cap_trigger_count: " << force_stats.cap_count << '\n';
@@ -350,6 +390,8 @@ int main(int ac, char *av[])
         std::cout << "final_cylinder_top_y_m: " << final_cylinder_top_y << '\n';
         std::cout << "final_cylinder_bottom_y_m: " << final_cylinder_bottom_y << '\n';
         std::cout << "final_top_submergence_m: " << final_top_submergence << '\n';
+        std::cout << "final_bottom_contact_overlap_m: " << final_bottom_contact_overlap << '\n';
+        std::cout << "max_bottom_contact_overlap_m: " << max_bottom_contact_overlap << '\n';
         std::cout << "max_center_error_m: " << max_center_error << '\n';
         std::cout << "max_abs_y_minus_freefall_m: " << max_abs_y_minus_freefall << '\n';
         std::cout << "max_abs_vy_minus_freefall_m_per_s: " << max_abs_vy_minus_freefall << '\n';
@@ -414,14 +456,39 @@ int main(int ac, char *av[])
             std::cerr << "ERROR: dense cylinder did not sink below the free surface enough; it may be rebounding at entry.\n";
             return 1;
         }
-        if (final_vy_two_way >= 0.0)
+        if (max_bottom_contact_overlap < kMinimumBottomContactOverlap)
         {
-            std::cerr << "ERROR: dense cylinder is moving upward at the end of the water-entry check.\n";
+            std::cerr << "ERROR: dense cylinder never contacted the LAMMPS bottom wall.\n";
             return 1;
         }
-        if (final_cylinder_bottom_y <= kParticleSpacing)
+        if (std::abs(final_cylinder_bottom_y - kBottomWallY) > kFinalBottomDistanceTolerance)
         {
-            std::cerr << "ERROR: water-entry check ran too close to the tank bottom for this no-contact DEM setup.\n";
+            std::cerr << "ERROR: dense cylinder did not remain near the bottom wall after contact.\n";
+            return 1;
+        }
+        if (std::abs(final_vy_two_way) > kFinalBottomSpeedTolerance)
+        {
+            std::cerr << "ERROR: dense cylinder has not settled enough after bottom contact.\n";
+            return 1;
+        }
+        if (final_bottom_contact_overlap > kFinalBottomDistanceTolerance)
+        {
+            std::cerr << "ERROR: bottom wall overlap is too large for this contact stiffness.\n";
+            return 1;
+        }
+        if (!output_file_exists_with_prefix(output_path, "DEM_Cylinder_ite_"))
+        {
+            std::cerr << "ERROR: DEM cylinder VTP visualization files were not written.\n";
+            return 1;
+        }
+        if (!output_file_exists_with_prefix(output_path, "DEM_Force_ite_"))
+        {
+            std::cerr << "ERROR: DEM force VTP visualization files were not written.\n";
+            return 1;
+        }
+        if (!std::filesystem::exists(latest_dem_cylinder_vtp) || !std::filesystem::exists(latest_dem_force_vtp))
+        {
+            std::cerr << "ERROR: latest DEM visualization VTP file is missing.\n";
             return 1;
         }
 

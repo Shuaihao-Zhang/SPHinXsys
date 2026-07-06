@@ -40,6 +40,12 @@ inline constexpr int kRelaxationSteps = 1000;
 inline constexpr int kRelaxationOutputInterval = 200;
 inline constexpr Real kForceRelaxationAlpha = 0.3;
 inline constexpr Real kForceCapWeightFactor = 5.0;
+inline constexpr Real kBottomWallY = 0.0;
+inline constexpr Real kContactNormalStiffness = 5.0e4;
+inline constexpr Real kContactRestitution = 0.2;
+inline constexpr Real kContactTangentialStiffness = 4.0e4;
+inline constexpr Real kContactTangentialDamping = 0.0;
+inline constexpr Real kContactFriction = 0.5;
 //----------------------------------------------------------------------
 //	Material parameters.
 //----------------------------------------------------------------------
@@ -60,6 +66,9 @@ inline constexpr Real kMinimumPostEntryFy = 1.0e-2;
 inline constexpr Real kMinimumTrajectoryDifference = 1.0e-5;
 inline constexpr Real kMassRelativeTolerance = 1.0e-12;
 inline constexpr Real kMinimumFinalTopSubmergence = 2.0 * kParticleSpacing;
+inline constexpr Real kMinimumBottomContactOverlap = 1.0e-5;
+inline constexpr Real kFinalBottomDistanceTolerance = 3.0 * kParticleSpacing;
+inline constexpr Real kFinalBottomSpeedTolerance = 0.15;
 inline const std::string kRelaxedCylinderReloadBodyName = "LammpsTwoWayWaterEntryCylinder";
 //----------------------------------------------------------------------
 //	Geometric shapes used in this case.
@@ -178,6 +187,11 @@ inline Real lammps_equivalent_sphere_density()
     return cylinder_mass() / lammps_sphere_volume();
 }
 
+inline Real bottom_wall_overlap(const Vec2d &center)
+{
+    return SMAX(Real(0), kBottomWallY - (center[1] - kCylinderRadius));
+}
+
 #if defined(LAMMPS_BIGBIG)
 using tagint_c = int64_t;
 #else
@@ -291,7 +305,7 @@ class LammpsDEMAdapter
              << "newton off\n"
              << "comm_modify vel yes\n"
              << "region box block -0.02 " << kTankLengthX + 0.02
-             << " -0.05 " << kTankHeightY + 0.08
+             << " -0.10 " << kTankHeightY + 0.08
              << " -0.001 0.001 units box\n"
              << "create_box 1 box\n"
              << "create_atoms 1 single "
@@ -300,13 +314,22 @@ class LammpsDEMAdapter
              << "set atom 1 diameter " << kCylinderDiameter
              << " density " << lammps_equivalent_sphere_density() << "\n"
              << "velocity all set 0.0 0.0 0.0 units box\n"
-             << "pair_style zero 0.1\n"
-             << "pair_coeff * *\n"
+             << "pair_style granular\n"
+             << "pair_coeff * * hooke " << kContactNormalStiffness << ' '
+             << kContactRestitution
+             << " tangential linear_history " << kContactTangentialStiffness << ' '
+             << kContactTangentialDamping << ' ' << kContactFriction
+             << " damping coeff_restitution\n"
              << "neighbor 0.01 bin\n"
              << "neigh_modify delay 0 every 1 check yes\n"
              << "fix int all nve/sphere\n"
              << "fix grav all gravity " << kGravity << " vector 0.0 -1.0 0.0\n"
              << "fix ext all external pf/callback 1 1\n"
+             << "fix floor all wall/gran granular hooke " << kContactNormalStiffness << ' '
+             << kContactRestitution
+             << " tangential linear_history " << kContactTangentialStiffness << ' '
+             << kContactTangentialDamping << ' ' << kContactFriction
+             << " damping coeff_restitution yplane " << kBottomWallY << " NULL contacts\n"
              << "timestep " << kDemMaxDt << "\n"
              << "thermo 1000000\n";
 
@@ -384,18 +407,19 @@ class LammpsDEMAdapter
     {
         std::array<double, 3> x{};
         std::array<double, 3> v{};
+        std::array<double, 3> f{};
         std::array<double, 3> omega{};
 
         lammps_gather_atoms(lammps_.get(), "x", 1, 3, x.data());
         lammps_.throw_if_error("gather atom positions");
         lammps_gather_atoms(lammps_.get(), "v", 1, 3, v.data());
         lammps_.throw_if_error("gather atom velocities");
+        lammps_gather_atoms(lammps_.get(), "f", 1, 3, f.data());
+        lammps_.throw_if_error("gather atom forces");
         lammps_gather_atoms(lammps_.get(), "omega", 1, 3, omega.data());
         lammps_.throw_if_error("gather atom angular velocities");
 
-        const Vec2d acceleration(
-            external_force_.force[0] / cylinder_mass(),
-            external_force_.force[1] / cylinder_mass() - kGravity);
+        const Vec2d acceleration = to_vec2d(f) / cylinder_mass();
 
         return DEMState{to_vec2d(x), to_vec2d(v), acceleration, static_cast<Real>(omega[2])};
     }
@@ -499,6 +523,7 @@ struct ForceSample
     Real raw_force_norm = 0.0;
     Real applied_force_norm = 0.0;
     Real cylinder_bottom_y = 0.0;
+    Real bottom_contact_overlap = 0.0;
     bool pre_entry_stat = false;
     bool post_entry_stat = false;
     bool capped = false;
@@ -571,6 +596,204 @@ inline Real water_entry_time()
 inline bool is_finite(const Vec2d &value)
 {
     return std::isfinite(value[0]) && std::isfinite(value[1]);
+}
+
+inline std::string format_iteration_index(int iteration)
+{
+    std::ostringstream stream;
+    stream << std::setw(10) << std::setfill('0') << iteration;
+    return stream.str();
+}
+
+inline std::filesystem::path dem_output_path(const std::string &prefix, int iteration)
+{
+    std::filesystem::path folder(IO::getEnvironment().OutputFolder());
+    std::filesystem::create_directories(folder);
+    return folder / (prefix + "_ite_" + format_iteration_index(iteration) + ".vtp");
+}
+
+inline void write_vec3(std::ofstream &file, const Vec2d &value)
+{
+    file << value[0] << ' ' << value[1] << " 0";
+}
+
+inline Vec2d gravity_force()
+{
+    return Vec2d(0.0, -cylinder_weight());
+}
+
+inline Vec2d net_force_from_lammps(const DEMState &dem_state)
+{
+    return cylinder_mass() * dem_state.acceleration;
+}
+
+inline Vec2d estimated_bottom_contact_force(const DEMState &dem_state, const Vec2d &applied_hydro_force)
+{
+    return net_force_from_lammps(dem_state) - gravity_force() - applied_hydro_force;
+}
+
+inline void write_vtp_time_value(std::ofstream &file, Real time)
+{
+    file << "    <FieldData>\n"
+         << "      <DataArray type=\"Float64\" Name=\"TimeValue\" NumberOfTuples=\"1\" format=\"ascii\">\n"
+         << "        " << time << "\n"
+         << "      </DataArray>\n"
+         << "    </FieldData>\n";
+}
+
+inline std::filesystem::path write_dem_cylinder_to_vtp(int iteration, Real time, const Vec2d &center, Real radius)
+{
+    constexpr int circle_segments = 128;
+    const std::filesystem::path file_path = dem_output_path("DEM_Cylinder", iteration);
+    std::ofstream file(file_path);
+    if (!file)
+    {
+        throw std::runtime_error("could not open DEM cylinder VTP for writing");
+    }
+
+    file << std::setprecision(17);
+    file << "<?xml version=\"1.0\"?>\n"
+         << "<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\">\n"
+         << "  <PolyData>\n";
+    write_vtp_time_value(file, time);
+    file << "    <Piece NumberOfPoints=\"" << circle_segments + 1
+         << "\" NumberOfVerts=\"1\" NumberOfLines=\"1\" NumberOfPolys=\"1\">\n"
+         << "      <PointData Scalars=\"Radius\">\n"
+         << "        <DataArray type=\"Float64\" Name=\"Radius\" NumberOfComponents=\"1\" format=\"ascii\">\n"
+         << "          ";
+    for (int i = 0; i <= circle_segments; ++i)
+    {
+        file << radius << ' ';
+    }
+    file << "\n"
+         << "        </DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"DEMCenter\" NumberOfComponents=\"3\" format=\"ascii\">\n"
+         << "          ";
+    for (int i = 0; i <= circle_segments; ++i)
+    {
+        write_vec3(file, center);
+        file << ' ';
+    }
+    file << "\n"
+         << "        </DataArray>\n"
+         << "      </PointData>\n"
+         << "      <Points>\n"
+         << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n"
+         << "          ";
+    write_vec3(file, center);
+    file << '\n';
+    for (int i = 0; i < circle_segments; ++i)
+    {
+        const Real angle = 2.0 * Pi * static_cast<Real>(i) / static_cast<Real>(circle_segments);
+        const Vec2d point(center[0] + radius * std::cos(angle),
+                          center[1] + radius * std::sin(angle));
+        file << "          ";
+        write_vec3(file, point);
+        file << '\n';
+    }
+    file << "        </DataArray>\n"
+         << "      </Points>\n"
+         << "      <Verts>\n"
+         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">0</DataArray>\n"
+         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">1</DataArray>\n"
+         << "      </Verts>\n"
+         << "      <Lines>\n"
+         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n"
+         << "          ";
+    for (int i = 1; i <= circle_segments; ++i)
+    {
+        file << i << ' ';
+    }
+    file << "1\n"
+         << "        </DataArray>\n"
+         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">"
+         << circle_segments + 1 << "</DataArray>\n"
+         << "      </Lines>\n"
+         << "      <Polys>\n"
+         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n"
+         << "          ";
+    for (int i = 1; i <= circle_segments; ++i)
+    {
+        file << i << ' ';
+    }
+    file << "\n"
+         << "        </DataArray>\n"
+         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">"
+         << circle_segments << "</DataArray>\n"
+         << "      </Polys>\n"
+         << "    </Piece>\n"
+         << "  </PolyData>\n"
+         << "</VTKFile>\n";
+
+    return file_path;
+}
+
+inline std::filesystem::path write_dem_force_to_vtp(int iteration,
+                                                    Real time,
+                                                    const DEMState &dem_state,
+                                                    const Vec2d &raw_hydro_force,
+                                                    const Vec2d &applied_hydro_force)
+{
+    const Vec2d net_force = net_force_from_lammps(dem_state);
+    const Vec2d contact_force = estimated_bottom_contact_force(dem_state, applied_hydro_force);
+    const std::filesystem::path file_path = dem_output_path("DEM_Force", iteration);
+    std::ofstream file(file_path);
+    if (!file)
+    {
+        throw std::runtime_error("could not open DEM force VTP for writing");
+    }
+
+    file << std::setprecision(17);
+    file << "<?xml version=\"1.0\"?>\n"
+         << "<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\">\n"
+         << "  <PolyData>\n";
+    write_vtp_time_value(file, time);
+    file << "    <Piece NumberOfPoints=\"1\" NumberOfVerts=\"1\" NumberOfLines=\"0\" NumberOfPolys=\"0\">\n"
+         << "      <PointData Vectors=\"HydrodynamicForceApplied\">\n"
+         << "        <DataArray type=\"Float64\" Name=\"HydrodynamicForceRaw\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, raw_hydro_force);
+    file << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"HydrodynamicForceApplied\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, applied_hydro_force);
+    file << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"GravityForce\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, gravity_force());
+    file << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"NetForceFromLAMMPS\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, net_force);
+    file << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"EstimatedBottomContactForce\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, contact_force);
+    file << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"Velocity\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, dem_state.velocity);
+    file << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"Acceleration\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, dem_state.acceleration);
+    file << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"Radius\" NumberOfComponents=\"1\" format=\"ascii\">"
+         << kCylinderRadius << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"MassPerUnitDepth\" NumberOfComponents=\"1\" format=\"ascii\">"
+         << cylinder_mass() << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"Time\" NumberOfComponents=\"1\" format=\"ascii\">"
+         << time << "</DataArray>\n"
+         << "        <DataArray type=\"Float64\" Name=\"BottomContactOverlap\" NumberOfComponents=\"1\" format=\"ascii\">"
+         << bottom_wall_overlap(dem_state.center) << "</DataArray>\n"
+         << "      </PointData>\n"
+         << "      <Points>\n"
+         << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, dem_state.center);
+    file << "</DataArray>\n"
+         << "      </Points>\n"
+         << "      <Verts>\n"
+         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">0</DataArray>\n"
+         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">1</DataArray>\n"
+         << "      </Verts>\n"
+         << "    </Piece>\n"
+         << "  </PolyData>\n"
+         << "</VTKFile>\n";
+
+    return file_path;
 }
 
 inline std::string generate_cylinder_boundary_particles(SPHSystem &sph_system, SolidBody &cylinder_boundary)
@@ -720,6 +943,7 @@ inline ForceSample make_force_sample(int number_of_iterations,
     sample.raw_force_norm = raw_force.norm();
     sample.applied_force_norm = applied_force.norm();
     sample.cylinder_bottom_y = dem_state.center[1] - kCylinderRadius;
+    sample.bottom_contact_overlap = bottom_wall_overlap(dem_state.center);
     sample.pre_entry_stat = sample.cylinder_bottom_y > kWaterHeight + kPreEntryClearanceForStats;
     sample.post_entry_stat = sample.cylinder_bottom_y < kWaterHeight - kPostEntryDepthForStats;
     sample.capped = capped;
@@ -762,7 +986,8 @@ inline void write_force_csv_header(std::ofstream &csv)
            "Fx_raw_N,Fy_raw_N,raw_force_norm_N,"
            "Fx_applied_N,Fy_applied_N,applied_force_norm_N,"
            "cylinder_weight_N,force_cap_N,capped,"
-           "cylinder_bottom_y_m,geometric_entry,pre_entry_stat,post_entry_stat\n";
+           "cylinder_bottom_y_m,bottom_contact_overlap_m,"
+           "geometric_entry,pre_entry_stat,post_entry_stat\n";
 }
 
 inline void write_force_csv_sample(std::ofstream &csv, const ForceSample &sample)
@@ -780,6 +1005,7 @@ inline void write_force_csv_sample(std::ofstream &csv, const ForceSample &sample
         << kForceCapWeightFactor * cylinder_weight() << ','
         << (sample.capped ? 1 : 0) << ','
         << sample.cylinder_bottom_y << ','
+        << sample.bottom_contact_overlap << ','
         << (geometric_entry ? 1 : 0) << ','
         << (sample.pre_entry_stat ? 1 : 0) << ','
         << (sample.post_entry_stat ? 1 : 0) << '\n';
