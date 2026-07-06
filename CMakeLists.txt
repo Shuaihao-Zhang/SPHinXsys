@@ -17,6 +17,7 @@ option(SPHINXSYS_MODULE_OPENCASCADE "Build extension relying on OpenCASCADE" OFF
 option(SPHINXSYS_USE_VTK "Build using VTK library for writing VTP/VTU files" OFF)
 option(SPHINXSYS_USE_SYCL "Build using SYCL acceleration or not" OFF)
 option(SPHINXSYS_USE_ONEDPL_SORTING "Build One DPL for particle sorting" ON)
+option(SPHINXSYS_WITH_LAMMPS "Enable optional LAMMPS DEM library examples" OFF)
 
 # ------ Global properties (Some cannot be set on INTERFACE targets)
 set(CMAKE_VERBOSE_MAKEFILE OFF CACHE BOOL "Enable verbose compilation commands for Makefile and Ninja" FORCE) # Extra fluff needed for Ninja: https://github.com/ninja-build/ninja/issues/900
