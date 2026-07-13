@@ -124,7 +124,7 @@ int main(int ac, char *av[])
 
         const std::filesystem::path motion_csv_path = "cylinder_motion.csv";
         const std::filesystem::path force_csv_path = "cylinder_force.csv";
-        const std::filesystem::path dll_path = "liblammps.dll";
+        const std::filesystem::path runtime_path = SPH::lammps_examples::lammps_runtime_path();
         const std::filesystem::path output_path = std::filesystem::absolute(IO::getEnvironment().OutputFolder());
         VtpPvdWriter water_body_pvd("WaterBody");
         VtpPvdWriter wall_boundary_pvd("WallBoundary");
@@ -189,6 +189,7 @@ int main(int ac, char *av[])
         MotionSample final_motion_sample;
         int number_of_iterations = 0;
         int lammps_step_count = 0;
+        Real max_lammps_clock_error = 0.0;
 
         DEMState dem_state = dem_adapter.pullState();
         driven_cylinder.update(dem_state);
@@ -197,7 +198,9 @@ int main(int ac, char *av[])
         pressure_force_on_cylinder.exec();
 
         Vec2d raw_force = sum_cylinder_hydro_force(cylinder_boundary);
-        ForceSample force_sample = make_force_sample(0, physical_time, dem_state, raw_force, previous_applied_force, false);
+        Real raw_hydrodynamic_torque = sum_cylinder_hydro_torque(cylinder_boundary, dem_state.center);
+        ForceSample force_sample = make_force_sample(
+            0, physical_time, dem_state, raw_force, previous_applied_force, raw_hydrodynamic_torque, false);
         final_motion_sample = make_motion_sample(0, lammps_step_count, physical_time, dem_state, driven_cylinder.geometricCenter());
         write_motion_csv_sample(motion_csv, final_motion_sample);
         write_force_csv_sample(force_csv, force_sample);
@@ -214,7 +217,8 @@ int main(int ac, char *av[])
         std::filesystem::path latest_dem_cylinder_vtp =
             write_dem_cylinder_to_vtp(0, physical_time, dem_state.center, kCylinderRadius);
         std::filesystem::path latest_dem_force_vtp =
-            write_dem_force_to_vtp(0, physical_time, dem_state, raw_force, previous_applied_force);
+            write_dem_force_to_vtp(
+                0, physical_time, dem_state, raw_force, previous_applied_force, raw_hydrodynamic_torque);
         dem_cylinder_pvd.add(physical_time, latest_dem_cylinder_vtp);
         dem_force_pvd.add(physical_time, latest_dem_force_vtp);
         int dem_visualization_output_count = 1;
@@ -224,7 +228,8 @@ int main(int ac, char *av[])
         //	step. The inner acoustic loop advances pressure/density, computes
         //	the hydrodynamic force on the cylinder, sends the relaxed/capped
         //	force to LAMMPS, and advances the disc over exactly the same
-        //	acoustic interval using DEM substeps plus one short remainder step.
+        //	acoustic interval using an integer number of nominal DEM steps.
+        //	A shortened step is reserved for an acoustic limit below kDemMaxDt.
         //----------------------------------------------------------------------
         TickCount t1 = TickCount::now();
         TimeInterval interval;
@@ -246,18 +251,25 @@ int main(int ac, char *av[])
             Real relaxation_time = 0.0;
             while (relaxation_time < advection_step - TinyReal && physical_time < kEndTime - TinyReal)
             {
-                const Real acoustic_step = SMIN(get_fluid_time_step_size.exec(),
-                                                SMIN(advection_step - relaxation_time, kEndTime - physical_time));
+                const Real acoustic_limit = SMIN(get_fluid_time_step_size.exec(),
+                                                 SMIN(advection_step - relaxation_time, kEndTime - physical_time));
+                const CouplingStepPlan coupling_plan = dem_adapter.planCouplingStep(acoustic_limit);
+                const Real acoustic_step = coupling_plan.coupled_dt;
                 pressure_relaxation.exec(acoustic_step);
                 pressure_force_on_cylinder.exec();
                 density_relaxation.exec(acoustic_step);
 
                 raw_force = sum_cylinder_hydro_force(cylinder_boundary);
+                raw_hydrodynamic_torque = sum_cylinder_hydro_torque(cylinder_boundary, dem_state.center);
                 const ForceApplication force_application = relax_and_cap_force(raw_force, previous_applied_force);
                 previous_applied_force = force_application.applied_force;
                 dem_adapter.setExternalForce(previous_applied_force);
 
-                lammps_step_count += dem_adapter.runForDuration(acoustic_step);
+                const CouplingAdvanceResult coupling_advance =
+                    dem_adapter.advance(coupling_plan, physical_time);
+                lammps_step_count += coupling_advance.dem_steps;
+                max_lammps_clock_error =
+                    std::max(max_lammps_clock_error, static_cast<Real>(coupling_advance.synchronization_error));
                 dem_state = dem_adapter.pullState();
                 driven_cylinder.update(dem_state);
 
@@ -268,7 +280,8 @@ int main(int ac, char *av[])
                 final_motion_sample =
                     make_motion_sample(number_of_iterations, lammps_step_count, physical_time, dem_state, driven_cylinder.geometricCenter());
                 force_sample = make_force_sample(
-                    number_of_iterations, physical_time, dem_state, raw_force, previous_applied_force, force_application.capped);
+                    number_of_iterations, physical_time, dem_state, raw_force, previous_applied_force,
+                    raw_hydrodynamic_torque, force_application.capped);
 
                 write_motion_csv_sample(motion_csv, final_motion_sample);
                 write_force_csv_sample(force_csv, force_sample);
@@ -291,7 +304,13 @@ int main(int ac, char *av[])
                               << "N=" << number_of_iterations
                               << " Time = " << physical_time
                               << " advection_step = " << advection_step
+                              << " acoustic_limit = " << acoustic_limit
                               << " acoustic_step = " << acoustic_step
+                              << " dem_steps = " << coupling_advance.dem_steps
+                              << " lammps_atime = " << coupling_advance.lammps_time
+                              << " driver_time = " << coupling_advance.driver_time
+                              << " driver_lammps_offset = " << coupling_advance.driver_lammps_offset
+                              << " clock_error = " << coupling_advance.synchronization_error
                               << " y = " << dem_state.center[1]
                               << " vy = " << dem_state.velocity[1]
                               << " Fy_raw = " << raw_force[1]
@@ -307,7 +326,8 @@ int main(int ac, char *av[])
                     latest_dem_cylinder_vtp =
                         write_dem_cylinder_to_vtp(output_iteration, physical_time, dem_state.center, kCylinderRadius);
                     latest_dem_force_vtp =
-                        write_dem_force_to_vtp(output_iteration, physical_time, dem_state, raw_force, previous_applied_force);
+                        write_dem_force_to_vtp(output_iteration, physical_time, dem_state, raw_force,
+                                               previous_applied_force, raw_hydrodynamic_torque);
                     dem_cylinder_pvd.add(physical_time, latest_dem_cylinder_vtp);
                     dem_force_pvd.add(physical_time, latest_dem_force_vtp);
                     ++dem_visualization_output_count;
@@ -332,7 +352,8 @@ int main(int ac, char *av[])
         //----------------------------------------------------------------------
         //	Statistics and regression-style checks.
         //----------------------------------------------------------------------
-        const ExternalForce &external_force = dem_adapter.externalForce();
+        const ExternalForceBuffer &external_force = dem_adapter.externalForce();
+        const std::array<double, 3> external_force_value = external_force.forceForId(1);
         const Vec2d pre_entry_mean_force = force_stats.pre_entry_mean_force();
         const Real pre_entry_mean_force_norm = force_stats.pre_entry_mean_force_norm();
         const Real post_entry_max_raw_fy =
@@ -352,7 +373,7 @@ int main(int ac, char *av[])
         std::cout << std::setprecision(17);
         std::cout << "SPHinXsys 2D two-way LAMMPS-driven water-entry example\n";
         std::cout << "Total wall time for computation: " << tt.seconds() << " seconds.\n";
-        std::cout << "liblammps_dll_in_working_directory: " << (std::filesystem::exists(dll_path) ? "yes" : "no") << '\n';
+        std::cout << "lammps_runtime_in_working_directory: " << (std::filesystem::exists(runtime_path) ? "yes" : "no") << '\n';
         std::cout << "lammps_version: " << dem_adapter.version() << '\n';
         std::cout << "cylinder_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
         std::cout << "cylinder_force_csv: " << std::filesystem::absolute(force_csv_path).string() << '\n';
@@ -385,15 +406,17 @@ int main(int ac, char *av[])
         std::cout << "advection_iterations: " << advection_iterations << '\n';
         std::cout << "number_of_iterations: " << number_of_iterations << '\n';
         std::cout << "lammps_substeps_executed: " << lammps_step_count << '\n';
+        std::cout << "max_lammps_clock_error_s: " << max_lammps_clock_error << '\n';
+        std::cout << "hydrodynamic_torque_feedback_enabled: no\n";
         std::cout << "entry_time_s: " << water_entry_time() << '\n';
         std::cout << "end_time_s: " << kEndTime << '\n';
         std::cout << "external_force_feedback_N: "
-                  << external_force.force[0] << ','
-                  << external_force.force[1] << ','
-                  << external_force.force[2] << '\n';
+                  << external_force_value[0] << ','
+                  << external_force_value[1] << ','
+                  << external_force_value[2] << '\n';
         std::cout << "external_force_feedback_includes_gravity: no\n";
-        std::cout << "callback_calls: " << external_force.callback_calls << '\n';
-        std::cout << "atom1_force_updates: " << external_force.atom1_updates << '\n';
+        std::cout << "callback_calls: " << external_force.callbackCalls() << '\n';
+        std::cout << "atom1_force_updates: " << external_force.atomUpdates() << '\n';
         std::cout << "final_lammps_center_m: "
                   << final_motion_sample.dem_state.center[0] << ','
                   << final_motion_sample.dem_state.center[1] << '\n';
@@ -424,12 +447,12 @@ int main(int ac, char *av[])
         std::cout << "post_entry_max_applied_Fy_N: " << post_entry_max_applied_fy << '\n';
         std::cout << "finite_state: " << (finite_state ? "yes" : "no") << '\n';
 
-        if (!std::filesystem::exists(dll_path))
+        if (!std::filesystem::exists(runtime_path))
         {
-            std::cerr << "ERROR: liblammps.dll was not copied next to the executable.\n";
+            std::cerr << "ERROR: the LAMMPS runtime library was not staged next to the executable.\n";
             return 1;
         }
-        if (external_force.callback_calls <= 0 || external_force.atom1_updates <= 0)
+        if (external_force.callbackCalls() <= 0 || external_force.atomUpdates() <= 0)
         {
             std::cerr << "ERROR: fix external callback did not update atom id=1.\n";
             return 1;

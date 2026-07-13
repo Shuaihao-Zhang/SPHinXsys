@@ -1,6 +1,7 @@
 #pragma once
 
 #include "lammps_instance.h"
+#include "lammps_dem_adapter_common.h"
 
 #include <algorithm>
 #include <array>
@@ -18,6 +19,13 @@
 namespace LammpsLinkOnly
 {
 using SPH::lammps_examples::LammpsInstance;
+using SPH::lammps_examples::CouplingAdvanceResult;
+using SPH::lammps_examples::ExternalForceBuffer;
+using SPH::lammps_examples::LammpsTimeIntegrator;
+using SPH::lammps_examples::ParticleForce;
+using SPH::lammps_examples::makeCouplingStepPlan;
+using SPH::lammps_examples::extract_atom_vector3_by_consecutive_id;
+using SPH::lammps_examples::validate_consecutive_atom_ids;
 //----------------------------------------------------------------------
 //	Single-particle DEM setup.
 //----------------------------------------------------------------------
@@ -29,13 +37,6 @@ inline constexpr double kTimeStep = 1.0e-5;
 inline constexpr int kTotalSteps = 1000;
 inline constexpr int kSampleEvery = 100;
 inline constexpr double kErrorTolerance = 1.0e-9;
-
-struct ExternalForce
-{
-    std::array<double, 3> force{0.0, 0.0, 0.0};
-    int callback_calls = 0;
-    int atom1_updates = 0;
-};
 
 struct DEMState
 {
@@ -54,38 +55,6 @@ struct MotionSample
     double z_minus_freefall = 0.0;
     double vz_minus_freefall = 0.0;
 };
-
-#if defined(LAMMPS_BIGBIG)
-using tagint_c = int64_t;
-#else
-using tagint_c = int;
-#endif
-
-extern "C" void external_force_callback(void *ptr,
-                                         int64_t /*timestep*/,
-                                         int nlocal,
-                                         tagint_c *ids,
-                                         double ** /*x*/,
-                                         double **fexternal)
-{
-    auto *external = static_cast<ExternalForce *>(ptr);
-    ++external->callback_calls;
-
-    for (int i = 0; i < nlocal; ++i)
-    {
-        fexternal[i][0] = 0.0;
-        fexternal[i][1] = 0.0;
-        fexternal[i][2] = 0.0;
-
-        if (ids[i] == 1)
-        {
-            fexternal[i][0] = external->force[0];
-            fexternal[i][1] = external->force[1];
-            fexternal[i][2] = external->force[2];
-            ++external->atom1_updates;
-        }
-    }
-}
 
 inline double sphere_mass()
 {
@@ -123,36 +92,36 @@ class LammpsDEMAdapter
              << "thermo 100\n";
 
         lammps_.commands_string(cmds.str(), "LAMMPS initialization commands");
-        lammps_set_fix_external_callback(lammps_.get(), "ext", &external_force_callback, &external_force_);
-        lammps_.throw_if_error("lammps_set_fix_external_callback");
+        external_force_.registerFix(lammps_, "ext");
     }
 
-    void runSubsteps(int steps)
+    CouplingAdvanceResult runSubsteps(int steps)
     {
         if (steps <= 0)
         {
-            return;
+            throw std::invalid_argument("LAMMPS substep count must be positive");
         }
-        lammps_.command("run " + std::to_string(steps) + " post no", "LAMMPS run chunk");
+        return time_integrator_.advance(
+            makeCouplingStepPlan(static_cast<double>(steps) * kTimeStep, kTimeStep));
     }
 
     DEMState pullState() const
     {
+        validate_consecutive_atom_ids(lammps_, 1);
         DEMState state;
-        lammps_gather_atoms(lammps_.get(), "x", 1, 3, state.center.data());
-        lammps_.throw_if_error("gather atom positions");
-        lammps_gather_atoms(lammps_.get(), "v", 1, 3, state.velocity.data());
-        lammps_.throw_if_error("gather atom velocities");
+        extract_atom_vector3_by_consecutive_id(lammps_, "x", 1, state.center.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "v", 1, state.velocity.data());
         return state;
     }
 
     int version() const { return lammps_.version(); }
 
-    const ExternalForce &externalForce() const { return external_force_; }
+    const ExternalForceBuffer &externalForce() const { return external_force_; }
 
   private:
+    ExternalForceBuffer external_force_;
     LammpsInstance lammps_;
-    ExternalForce external_force_;
+    LammpsTimeIntegrator time_integrator_{lammps_, kTimeStep};
 };
 
 inline MotionSample make_motion_sample(int number_of_iterations,

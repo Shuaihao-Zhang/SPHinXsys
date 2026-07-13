@@ -2,6 +2,7 @@
 
 #include "sphinxsys.h"
 #include "lammps_instance.h"
+#include "lammps_dem_adapter_common.h"
 #include "lammps_io.h"
 
 #include <algorithm>
@@ -25,6 +26,12 @@ using namespace SPH;
 namespace LammpsGranularCollapse2D
 {
 using SPH::lammps_examples::LammpsInstance;
+using SPH::lammps_examples::CouplingAdvanceResult;
+using SPH::lammps_examples::CouplingStepPlan;
+using SPH::lammps_examples::LammpsTimeIntegrator;
+using SPH::lammps_examples::makeCouplingStepPlan;
+using SPH::lammps_examples::extract_atom_vector3_by_consecutive_id;
+using SPH::lammps_examples::validate_consecutive_atom_ids;
 using SPH::lammps_examples::VtpPvdWriter;
 using SPH::lammps_examples::VtpScalarPointField;
 using SPH::lammps_examples::VtpVectorPointField2d;
@@ -47,6 +54,7 @@ inline constexpr Real kEndTime = 0.12;
 inline constexpr Real kVtpOutputInterval = 0.01;
 
 inline constexpr Real kGrainDensity = 2500.0;
+inline constexpr Real kOutOfPlaneDepth = 1.0;
 inline constexpr Real kGravity = 9.81;
 inline constexpr Real kBottomWallY = 0.0;
 inline constexpr Real kLeftWallX = 0.0;
@@ -99,7 +107,7 @@ inline Real grain_area()
 
 inline Real grain_mass()
 {
-    return kGrainDensity * grain_area();
+    return kGrainDensity * grain_area() * kOutOfPlaneDepth;
 }
 
 inline Real grain_weight()
@@ -193,57 +201,24 @@ class LammpsDEMOnlyColumnAdapter
         lammps_.command("run 0 post no", "LAMMPS initial force evaluation");
     }
 
-    void runSubsteps(int steps)
+    CouplingStepPlan planCouplingStep(Real duration_limit) const
     {
-        if (steps <= 0)
-        {
-            return;
-        }
-        lammps_.command("run " + std::to_string(steps) + " post no", "LAMMPS DEM-only run chunk");
+        return makeCouplingStepPlan(duration_limit, kDemDt);
     }
 
-    void setTimestep(double dem_timestep)
+    CouplingAdvanceResult advance(const CouplingStepPlan &plan)
     {
-        std::ostringstream cmd;
-        cmd << std::setprecision(17) << "timestep " << dem_timestep;
-        lammps_.command(cmd.str(), "LAMMPS timestep update");
+        return time_integrator_.advance(plan);
+    }
+
+    CouplingAdvanceResult advance(const CouplingStepPlan &plan, Real driver_time_before)
+    {
+        return time_integrator_.advance(plan, driver_time_before);
     }
 
     int runForDuration(Real duration)
     {
-        if (duration <= TinyReal)
-        {
-            return 0;
-        }
-
-        const Real steps_as_real = duration / kDemDt;
-        const int rounded_steps = static_cast<int>(std::llround(steps_as_real));
-        if (rounded_steps > 0 &&
-            std::abs(steps_as_real - static_cast<Real>(rounded_steps)) < 1.0e-10)
-        {
-            setTimestep(kDemDt);
-            runSubsteps(rounded_steps);
-            return rounded_steps;
-        }
-
-        const int full_steps = static_cast<int>(std::floor(duration / kDemDt));
-        const Real remainder = duration - static_cast<Real>(full_steps) * kDemDt;
-        int executed_steps = 0;
-
-        if (full_steps > 0)
-        {
-            setTimestep(kDemDt);
-            runSubsteps(full_steps);
-            executed_steps += full_steps;
-        }
-        if (remainder > TinyReal)
-        {
-            setTimestep(remainder);
-            runSubsteps(1);
-            setTimestep(kDemDt);
-            executed_steps += 1;
-        }
-        return executed_steps;
+        return advance(planCouplingStep(duration)).dem_steps;
     }
 
     Real particleMass() const
@@ -259,19 +234,16 @@ class LammpsDEMOnlyColumnAdapter
 
     std::vector<DEMParticleState> pullStates() const
     {
+        validate_consecutive_atom_ids(lammps_, kParticleCount);
         std::array<double, 3 * kParticleCount> x{};
         std::array<double, 3 * kParticleCount> v{};
         std::array<double, 3 * kParticleCount> f{};
         std::array<double, 3 * kParticleCount> omega{};
 
-        lammps_gather_atoms(lammps_.get(), "x", 1, 3, x.data());
-        lammps_.throw_if_error("gather atom positions");
-        lammps_gather_atoms(lammps_.get(), "v", 1, 3, v.data());
-        lammps_.throw_if_error("gather atom velocities");
-        lammps_gather_atoms(lammps_.get(), "f", 1, 3, f.data());
-        lammps_.throw_if_error("gather atom forces");
-        lammps_gather_atoms(lammps_.get(), "omega", 1, 3, omega.data());
-        lammps_.throw_if_error("gather atom angular velocities");
+        extract_atom_vector3_by_consecutive_id(lammps_, "x", kParticleCount, x.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "v", kParticleCount, v.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "f", kParticleCount, f.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "omega", kParticleCount, omega.data());
 
         std::vector<DEMParticleState> states;
         states.reserve(kParticleCount);
@@ -294,6 +266,7 @@ class LammpsDEMOnlyColumnAdapter
 
   private:
     LammpsInstance lammps_;
+    LammpsTimeIntegrator time_integrator_{lammps_, kDemDt};
 };
 
 inline bool is_finite(const Vec2d &value)

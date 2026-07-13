@@ -22,6 +22,12 @@ struct VtpVectorField2d
     Vec2d value;
 };
 
+struct VtpVectorField3d
+{
+    std::string name;
+    Vec3d value;
+};
+
 struct VtpScalarField
 {
     std::string name;
@@ -100,6 +106,11 @@ class VtpPvdWriter
 inline void write_vec3(std::ofstream &file, const Vec2d &value)
 {
     file << value[0] << ' ' << value[1] << " 0";
+}
+
+inline void write_vec3(std::ofstream &file, const Vec3d &value)
+{
+    file << value[0] << ' ' << value[1] << ' ' << value[2];
 }
 
 inline void write_vtp_time_value(std::ofstream &file, Real time)
@@ -231,6 +242,64 @@ inline std::filesystem::path write_dem_point_fields_to_vtp(
     }
     file << ">\n";
     for (const VtpVectorField2d &field : vector_fields)
+    {
+        file << "        <DataArray type=\"Float64\" Name=\"" << field.name
+             << "\" NumberOfComponents=\"3\" format=\"ascii\">";
+        write_vec3(file, field.value);
+        file << "</DataArray>\n";
+    }
+    for (const VtpScalarField &field : scalar_fields)
+    {
+        file << "        <DataArray type=\"Float64\" Name=\"" << field.name
+             << "\" NumberOfComponents=\"1\" format=\"ascii\">"
+             << field.value << "</DataArray>\n";
+    }
+    file << "      </PointData>\n"
+         << "      <Points>\n"
+         << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">";
+    write_vec3(file, point);
+    file << "</DataArray>\n"
+         << "      </Points>\n"
+         << "      <Verts>\n"
+         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">0</DataArray>\n"
+         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">1</DataArray>\n"
+         << "      </Verts>\n"
+         << "    </Piece>\n"
+         << "  </PolyData>\n"
+         << "</VTKFile>\n";
+
+    return file_path;
+}
+
+inline std::filesystem::path write_dem_point_fields_to_vtp(
+    int iteration,
+    Real time,
+    const std::string &prefix,
+    const Vec3d &point,
+    const std::vector<VtpVectorField3d> &vector_fields,
+    const std::vector<VtpScalarField> &scalar_fields,
+    const std::string &active_vector_name = "")
+{
+    const std::filesystem::path file_path = lammps_example_output_path(prefix, iteration);
+    std::ofstream file(file_path);
+    if (!file)
+    {
+        throw std::runtime_error("could not open 3D DEM point-field VTP for writing");
+    }
+
+    file << std::setprecision(17);
+    file << "<?xml version=\"1.0\"?>\n"
+         << "<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\">\n"
+         << "  <PolyData>\n";
+    write_vtp_time_value(file, time);
+    file << "    <Piece NumberOfPoints=\"1\" NumberOfVerts=\"1\" NumberOfLines=\"0\" NumberOfPolys=\"0\">\n"
+         << "      <PointData";
+    if (!active_vector_name.empty())
+    {
+        file << " Vectors=\"" << active_vector_name << "\"";
+    }
+    file << ">\n";
+    for (const VtpVectorField3d &field : vector_fields)
     {
         file << "        <DataArray type=\"Float64\" Name=\"" << field.name
              << "\" NumberOfComponents=\"3\" format=\"ascii\">";

@@ -26,7 +26,7 @@ int main()
 
         const std::filesystem::path motion_csv_path = "dem_motion.csv";
         const std::filesystem::path force_csv_path = "dem_force.csv";
-        const std::filesystem::path dll_path = "liblammps.dll";
+        const std::filesystem::path runtime_path = SPH::lammps_examples::lammps_runtime_path();
         const std::filesystem::path output_path = std::filesystem::absolute(IO::getEnvironment().OutputFolder());
 
         VtpPvdWriter dem_discs_pvd("DEM_Discs");
@@ -83,8 +83,11 @@ int main()
             {
                 continue;
             }
-            lammps_step_count += dem_adapter.runForDuration(duration);
-            physical_time = target_time;
+            const CouplingStepPlan coupling_plan = dem_adapter.planCouplingStep(duration);
+            const CouplingAdvanceResult coupling_advance =
+                dem_adapter.advance(coupling_plan, physical_time);
+            lammps_step_count += coupling_advance.dem_steps;
+            physical_time = coupling_advance.lammps_time;
             ++output_count;
 
             states = dem_adapter.pullStates();
@@ -120,7 +123,7 @@ int main()
 
         std::cout << std::setprecision(17);
         std::cout << "SPHinXsys LAMMPS DEM-only 2D granular collapse example\n";
-        std::cout << "liblammps_dll_in_working_directory: " << (std::filesystem::exists(dll_path) ? "yes" : "no") << '\n';
+        std::cout << "lammps_runtime_in_working_directory: " << (std::filesystem::exists(runtime_path) ? "yes" : "no") << '\n';
         std::cout << "lammps_version: " << dem_adapter.version() << '\n';
         std::cout << "dem_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
         std::cout << "dem_force_csv: " << std::filesystem::absolute(force_csv_path).string() << '\n';
@@ -151,9 +154,9 @@ int main()
         std::cout << "hydrodynamic_force_feedback_enabled: no\n";
         std::cout << "finite_state: " << (finite_state ? "yes" : "no") << '\n';
 
-        if (!std::filesystem::exists(dll_path))
+        if (!std::filesystem::exists(runtime_path))
         {
-            std::cerr << "ERROR: liblammps.dll was not copied next to the executable.\n";
+            std::cerr << "ERROR: the LAMMPS runtime library was not staged next to the executable.\n";
             return 1;
         }
         if (!finite_state)

@@ -2,6 +2,8 @@
 
 #include "sphinxsys.h"
 #include "lammps_instance.h"
+#include "lammps_dem_adapter_common.h"
+#include "lammps_io.h"
 
 #include <algorithm>
 #include <array>
@@ -23,6 +25,14 @@ using namespace SPH;
 namespace LammpsTwoWayWaterEntry
 {
 using SPH::lammps_examples::LammpsInstance;
+using SPH::lammps_examples::CouplingAdvanceResult;
+using SPH::lammps_examples::CouplingStepPlan;
+using SPH::lammps_examples::ExternalForceBuffer;
+using SPH::lammps_examples::LammpsTimeIntegrator;
+using SPH::lammps_examples::ParticleForce;
+using SPH::lammps_examples::makeCouplingStepPlan;
+using SPH::lammps_examples::extract_atom_vector3_by_consecutive_id;
+using SPH::lammps_examples::validate_consecutive_atom_ids;
 //----------------------------------------------------------------------
 //	Basic geometry parameters and numerical setup.
 //----------------------------------------------------------------------
@@ -141,51 +151,12 @@ class HydrostaticPressureField : public fluid_dynamics::FluidInitialCondition
 //----------------------------------------------------------------------
 //	LAMMPS one-particle DEM adapter.
 //----------------------------------------------------------------------
-struct ExternalForce
-{
-    std::array<double, 3> force{0.0, 0.0, 0.0};
-    int callback_calls = 0;
-    int atom1_updates = 0;
-};
-
 struct DEMState
 {
     Vec3d center = Vec3d::Zero();
     Vec3d velocity = Vec3d::Zero();
     Vec3d omega = Vec3d::Zero();
 };
-
-#if defined(LAMMPS_BIGBIG)
-using tagint_c = int64_t;
-#else
-using tagint_c = int;
-#endif
-
-extern "C" void external_force_callback(void *ptr,
-                                         int64_t /*timestep*/,
-                                         int nlocal,
-                                         tagint_c *ids,
-                                         double ** /*x*/,
-                                         double **fexternal)
-{
-    auto *external = static_cast<ExternalForce *>(ptr);
-    ++external->callback_calls;
-
-    for (int i = 0; i < nlocal; ++i)
-    {
-        fexternal[i][0] = 0.0;
-        fexternal[i][1] = 0.0;
-        fexternal[i][2] = 0.0;
-
-        if (ids[i] == 1)
-        {
-            fexternal[i][0] = external->force[0];
-            fexternal[i][1] = external->force[1];
-            fexternal[i][2] = external->force[2];
-            ++external->atom1_updates;
-        }
-    }
-}
 
 inline Vec3d to_vec3d(const std::array<double, 3> &values)
 {
@@ -246,90 +217,57 @@ class LammpsDEMAdapter
              << "thermo 1000000\n";
 
         lammps_.commands_string(cmds.str(), "LAMMPS initialization commands");
-        lammps_set_fix_external_callback(lammps_.get(), "ext", &external_force_callback, &external_force_);
-        lammps_.throw_if_error("lammps_set_fix_external_callback");
+        external_force_.registerFix(lammps_, "ext");
     }
 
-    void runSubsteps(int steps)
+    CouplingStepPlan planCouplingStep(Real acoustic_limit) const
     {
-        if (steps <= 0)
-        {
-            return;
-        }
-        lammps_.command("run " + std::to_string(steps) + " post no", "LAMMPS run chunk");
+        return makeCouplingStepPlan(acoustic_limit, kDemMaxDt);
     }
 
-    void setTimestep(double dem_timestep)
+    CouplingAdvanceResult advance(const CouplingStepPlan &plan)
     {
-        std::ostringstream cmd;
-        cmd << std::setprecision(17) << "timestep " << dem_timestep;
-        lammps_.command(cmd.str(), "LAMMPS timestep update");
+        return time_integrator_.advance(plan);
     }
 
-    // Synchronize LAMMPS to one SPH acoustic step. Most DEM substeps use
-    // kDemMaxDt, and a final short step removes the remaining time mismatch.
+    CouplingAdvanceResult advance(const CouplingStepPlan &plan, Real driver_time_before)
+    {
+        return time_integrator_.advance(plan, driver_time_before);
+    }
+
     int runForDuration(Real acoustic_step)
     {
-        if (acoustic_step <= TinyReal)
-        {
-            return 0;
-        }
-
-        const int full_steps = static_cast<int>(std::floor(acoustic_step / kDemMaxDt));
-        const Real remainder = acoustic_step - static_cast<Real>(full_steps) * kDemMaxDt;
-        int executed_steps = 0;
-
-        // Run most of the acoustic interval with the nominal DEM timestep.
-        if (full_steps > 0)
-        {
-            setTimestep(kDemMaxDt);
-            runSubsteps(full_steps);
-            executed_steps += full_steps;
-        }
-
-        // Use one short tail step so the LAMMPS time exactly matches the SPH acoustic step.
-        if (remainder > TinyReal)
-        {
-            setTimestep(remainder);
-            runSubsteps(1);
-            setTimestep(kDemMaxDt);
-            executed_steps += 1;
-        }
-
-        return executed_steps;
+        return advance(planCouplingStep(acoustic_step)).dem_steps;
     }
 
     void setExternalForce(const Vec3d &force)
     {
         // This value is consumed by fix external pf/callback during LAMMPS run.
-        external_force_.force[0] = force[0];
-        external_force_.force[1] = force[1];
-        external_force_.force[2] = force[2];
+        external_force_.setForces({ParticleForce{1, {force[0], force[1], force[2]}}});
     }
 
     DEMState pullState() const
     {
+        validate_consecutive_atom_ids(lammps_, 1);
         std::array<double, 3> x{};
         std::array<double, 3> v{};
         std::array<double, 3> omega{};
 
-        lammps_gather_atoms(lammps_.get(), "x", 1, 3, x.data());
-        lammps_.throw_if_error("gather atom positions");
-        lammps_gather_atoms(lammps_.get(), "v", 1, 3, v.data());
-        lammps_.throw_if_error("gather atom velocities");
-        lammps_gather_atoms(lammps_.get(), "omega", 1, 3, omega.data());
-        lammps_.throw_if_error("gather atom angular velocities");
+        extract_atom_vector3_by_consecutive_id(lammps_, "x", 1, x.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "v", 1, v.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "omega", 1, omega.data());
 
         return DEMState{to_vec3d(x), to_vec3d(v), to_vec3d(omega)};
     }
 
     int version() const { return lammps_.version(); }
 
-    const ExternalForce &externalForce() const { return external_force_; }
+    const ExternalForceBuffer &externalForce() const { return external_force_; }
 
   private:
+    ExternalForceBuffer external_force_;
     LammpsInstance lammps_;
-    ExternalForce external_force_;
+    LammpsTimeIntegrator time_integrator_{lammps_, kDemMaxDt};
 };
 //----------------------------------------------------------------------
 //	two-way moving boundary driven by the LAMMPS particle state.
@@ -367,7 +305,7 @@ class DrivenSphereBoundary
         for (UnsignedInt i = 0; i != particles_.TotalRealParticles(); ++i)
         {
             pos_[i] = state.center + relative_positions_[i];
-            vel_[i] = state.velocity;
+            vel_[i] = state.velocity + state.omega.cross(relative_positions_[i]);
         }
         sphere_body_.setNewlyUpdated();
     }
@@ -417,6 +355,7 @@ struct ForceSample
     Vec3d applied_force = Vec3d::Zero();
     Real raw_force_norm = 0.0;
     Real applied_force_norm = 0.0;
+    Vec3d raw_hydrodynamic_torque = Vec3d::Zero();
     Real sphere_bottom_z = 0.0;
     bool pre_entry_stat = false;
     bool post_entry_stat = false;
@@ -631,6 +570,40 @@ inline Vec3d sum_sphere_hydro_force(SPHBody &sphere)
     return total;
 }
 
+inline Vec3d sum_sphere_hydro_torque(SPHBody &sphere, const Vec3d &center)
+{
+    BaseParticles &particles = sphere.getBaseParticles();
+    Vecd *positions = particles.ParticlePositions();
+    Vecd *pressure_force = particles.getVariableDataByName<Vecd>("PressureForceFromFluid");
+    Vecd *viscous_force = particles.getVariableDataByName<Vecd>("ViscousForceFromFluid");
+
+    Vec3d torque = Vec3d::Zero();
+    for (UnsignedInt i = 0; i != particles.TotalRealParticles(); ++i)
+    {
+        const Vec3d relative_position = positions[i] - center;
+        const Vecd particle_force = pressure_force[i] + viscous_force[i];
+        torque += relative_position.cross(
+            Vec3d(particle_force[0], particle_force[1], particle_force[2]));
+    }
+    return torque;
+}
+
+inline std::filesystem::path write_dem_load_to_vtp(
+    int iteration, Real time, const DEMState &state,
+    const Vec3d &raw_hydrodynamic_force, const Vec3d &applied_hydrodynamic_force,
+    const Vec3d &raw_hydrodynamic_torque)
+{
+    return SPH::lammps_examples::write_dem_point_fields_to_vtp(
+        iteration, time, "DEM_Load", state.center,
+        {{"HydrodynamicForceRaw", raw_hydrodynamic_force},
+         {"HydrodynamicForceApplied", applied_hydrodynamic_force},
+         {"HydrodynamicTorqueRaw", raw_hydrodynamic_torque},
+         {"Velocity", state.velocity},
+         {"AngularVelocity", state.omega}},
+        {{"Radius", kSphereRadius}, {"Mass", sphere_mass()}},
+        "HydrodynamicForceApplied");
+}
+
 struct ForceApplication
 {
     Vec3d applied_force = Vec3d::Zero();
@@ -678,9 +651,10 @@ inline MotionSample make_motion_sample(int number_of_iterations,
 inline ForceSample make_force_sample(int number_of_iterations,
                                      Real time,
                                      const DEMState &dem_state,
-                                     const Vec3d &raw_force,
-                                     const Vec3d &applied_force,
-                                     bool capped)
+                                      const Vec3d &raw_force,
+                                      const Vec3d &applied_force,
+                                      const Vec3d &raw_hydrodynamic_torque,
+                                      bool capped)
 {
     ForceSample sample;
     sample.number_of_iterations = number_of_iterations;
@@ -689,6 +663,7 @@ inline ForceSample make_force_sample(int number_of_iterations,
     sample.applied_force = applied_force;
     sample.raw_force_norm = raw_force.norm();
     sample.applied_force_norm = applied_force.norm();
+    sample.raw_hydrodynamic_torque = raw_hydrodynamic_torque;
     sample.sphere_bottom_z = dem_state.center[2] - kSphereRadius;
     sample.pre_entry_stat = sample.sphere_bottom_z > kWaterHeight + kPreEntryClearanceForStats;
     sample.post_entry_stat = sample.sphere_bottom_z < kWaterHeight - kPostEntryDepthForStats;
@@ -735,6 +710,7 @@ inline void write_force_csv_header(std::ofstream &csv)
     csv << "number_of_iterations,time_s,"
            "Fx_raw_N,Fy_raw_N,Fz_raw_N,raw_force_norm_N,"
            "Fx_applied_N,Fy_applied_N,Fz_applied_N,applied_force_norm_N,"
+           "Tx_raw_Nm,Ty_raw_Nm,Tz_raw_Nm,raw_torque_norm_Nm,"
            "sphere_weight_N,force_cap_N,capped,"
            "sphere_bottom_z_m,geometric_entry,pre_entry_stat,post_entry_stat\n";
 }
@@ -752,6 +728,10 @@ inline void write_force_csv_sample(std::ofstream &csv, const ForceSample &sample
         << sample.applied_force[1] << ','
         << sample.applied_force[2] << ','
         << sample.applied_force_norm << ','
+        << sample.raw_hydrodynamic_torque[0] << ','
+        << sample.raw_hydrodynamic_torque[1] << ','
+        << sample.raw_hydrodynamic_torque[2] << ','
+        << sample.raw_hydrodynamic_torque.norm() << ','
         << sphere_weight() << ','
         << kForceCapWeightFactor * sphere_weight() << ','
         << (sample.capped ? 1 : 0) << ','

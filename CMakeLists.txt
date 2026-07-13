@@ -19,6 +19,11 @@ option(SPHINXSYS_USE_SYCL "Build using SYCL acceleration or not" OFF)
 option(SPHINXSYS_USE_ONEDPL_SORTING "Build One DPL for particle sorting" ON)
 option(SPHINXSYS_WITH_LAMMPS "Enable optional LAMMPS DEM library examples" OFF)
 
+if(SPHINXSYS_WITH_LAMMPS)
+    include(SPHinXsysLAMMPS)
+    sphinxsys_configure_lammps_dependency()
+endif()
+
 # ------ Global properties (Some cannot be set on INTERFACE targets)
 set(CMAKE_VERBOSE_MAKEFILE OFF CACHE BOOL "Enable verbose compilation commands for Makefile and Ninja" FORCE) # Extra fluff needed for Ninja: https://github.com/ninja-build/ninja/issues/900
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON) # Generate `compile_commands.json` file which is necessary for code completioner, static analyzer, etc

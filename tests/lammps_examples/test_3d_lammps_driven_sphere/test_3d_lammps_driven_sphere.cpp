@@ -40,7 +40,7 @@ int main(int ac, char *av[])
         write_sphere_state.addToWrite<Vecd>(sphere_boundary, "Velocity");
 
         const std::filesystem::path motion_csv_path = "sphere_motion.csv";
-        const std::filesystem::path dll_path = "liblammps.dll";
+        const std::filesystem::path runtime_path = SPH::lammps_examples::lammps_runtime_path();
         const std::filesystem::path output_path = std::filesystem::absolute(IO::getEnvironment().OutputFolder());
 
         std::ofstream motion_csv(motion_csv_path);
@@ -88,22 +88,23 @@ int main(int ac, char *av[])
 
         motion_csv.close();
 
-        const ExternalForce &external_force = dem_adapter.externalForce();
+        const ExternalForceBuffer &external_force = dem_adapter.externalForce();
+        const std::array<double, 3> external_force_value = external_force.forceForId(1);
 
         std::cout << std::setprecision(17);
         std::cout << "SPHinXsys LAMMPS-driven sphere boundary example\n";
-        std::cout << "liblammps_dll_in_working_directory: " << (std::filesystem::exists(dll_path) ? "yes" : "no") << '\n';
+        std::cout << "lammps_runtime_in_working_directory: " << (std::filesystem::exists(runtime_path) ? "yes" : "no") << '\n';
         std::cout << "lammps_version: " << dem_adapter.version() << '\n';
         std::cout << "sphere_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
         std::cout << "VTP_output_folder: " << output_path.string() << '\n';
         std::cout << "sph_sphere_particles: " << driven_sphere.particleCount() << '\n';
         std::cout << "sphere_mass_kg: " << sphere_mass() << '\n';
         std::cout << "external_force_feedback_N: "
-                  << external_force.force[0] << ','
-                  << external_force.force[1] << ','
-                  << external_force.force[2] << '\n';
-        std::cout << "callback_calls: " << external_force.callback_calls << '\n';
-        std::cout << "atom1_force_updates: " << external_force.atom1_updates << '\n';
+                  << external_force_value[0] << ','
+                  << external_force_value[1] << ','
+                  << external_force_value[2] << '\n';
+        std::cout << "callback_calls: " << external_force.callbackCalls() << '\n';
+        std::cout << "atom1_force_updates: " << external_force.atomUpdates() << '\n';
         std::cout << "number_of_iterations: " << number_of_iterations << '\n';
         std::cout << "lammps_substeps_executed: " << lammps_step_count << '\n';
         std::cout << "final_lammps_center_m: "
@@ -121,12 +122,12 @@ int main(int ac, char *av[])
         std::cout << "max_abs_z_minus_freefall_m: " << max_abs_z_minus_freefall << '\n';
         std::cout << "max_abs_vz_minus_freefall_m_per_s: " << max_abs_vz_minus_freefall << '\n';
 
-        if (!std::filesystem::exists(dll_path))
+        if (!std::filesystem::exists(runtime_path))
         {
-            std::cerr << "ERROR: liblammps.dll was not copied next to the executable.\n";
+            std::cerr << "ERROR: the LAMMPS runtime library was not staged next to the executable.\n";
             return 1;
         }
-        if (external_force.callback_calls <= 0 || external_force.atom1_updates <= 0)
+        if (external_force.callbackCalls() <= 0 || external_force.atomUpdates() <= 0)
         {
             std::cerr << "ERROR: fix external callback did not update atom id=1.\n";
             return 1;

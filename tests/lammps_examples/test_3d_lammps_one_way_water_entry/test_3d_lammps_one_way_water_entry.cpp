@@ -121,7 +121,7 @@ int main(int ac, char *av[])
 
         const std::filesystem::path motion_csv_path = "sphere_motion.csv";
         const std::filesystem::path force_csv_path = "sphere_force.csv";
-        const std::filesystem::path dll_path = "liblammps.dll";
+        const std::filesystem::path runtime_path = SPH::lammps_examples::lammps_runtime_path();
         const std::filesystem::path output_path = std::filesystem::absolute(IO::getEnvironment().OutputFolder());
 
         std::ofstream motion_csv(motion_csv_path);
@@ -162,6 +162,7 @@ int main(int ac, char *av[])
         MotionSample final_motion_sample;
         int number_of_iterations = 0;
         int lammps_step_count = 0;
+        Real max_lammps_clock_error = 0.0;
 
         DEMState dem_state = dem_adapter.pullState();
         driven_sphere.update(dem_state);
@@ -170,9 +171,11 @@ int main(int ac, char *av[])
         pressure_force_on_sphere.exec();
 
         Vec3d hydro_force = sum_sphere_hydro_force(sphere_boundary);
+        Vec3d hydro_torque = sum_sphere_hydro_torque(sphere_boundary, dem_state.center);
         final_motion_sample =
             make_motion_sample(number_of_iterations, lammps_step_count, physical_time, dem_state, driven_sphere.geometricCenter());
-        ForceSample force_sample = make_force_sample(number_of_iterations, physical_time, dem_state, hydro_force);
+        ForceSample force_sample = make_force_sample(
+            number_of_iterations, physical_time, dem_state, hydro_force, hydro_torque);
         write_motion_csv_sample(motion_csv, final_motion_sample);
         write_force_csv_sample(force_csv, force_sample);
         max_center_error = std::max(max_center_error, final_motion_sample.center_error);
@@ -182,6 +185,8 @@ int main(int ac, char *av[])
             std::max(max_abs_vz_minus_freefall, std::abs(final_motion_sample.vz_minus_freefall));
         force_stats.add(force_sample);
         write_real_body_states.writeToFile(0);
+        std::filesystem::path latest_dem_load_vtp =
+            write_dem_load_to_vtp(0, physical_time, dem_state, hydro_force, hydro_torque);
 
         //----------------------------------------------------------------------
         //	Main loop starts here. The outer loop follows the fluid advection
@@ -211,17 +216,24 @@ int main(int ac, char *av[])
             Real relaxation_time = 0.0;
             while (relaxation_time < advection_step - TinyReal && physical_time < kEndTime - TinyReal)
             {
-                const Real acoustic_step = SMIN(get_fluid_time_step_size.exec(),
-                                                SMIN(advection_step - relaxation_time, kEndTime - physical_time));
+                const Real acoustic_limit = SMIN(get_fluid_time_step_size.exec(),
+                                                 SMIN(advection_step - relaxation_time, kEndTime - physical_time));
+                const CouplingStepPlan coupling_plan = dem_adapter.planCouplingStep(acoustic_limit);
+                const Real acoustic_step = coupling_plan.coupled_dt;
                 pressure_relaxation.exec(acoustic_step);
                 pressure_force_on_sphere.exec();
                 density_relaxation.exec(acoustic_step);
 
                 hydro_force = sum_sphere_hydro_force(sphere_boundary);
+                hydro_torque = sum_sphere_hydro_torque(sphere_boundary, dem_state.center);
 
                 // One-way coupling: LAMMPS advances under gravity only. No SPH
                 // hydrodynamic force is pushed through fix external in this case.
-                lammps_step_count += dem_adapter.runForDuration(acoustic_step);
+                const CouplingAdvanceResult coupling_advance =
+                    dem_adapter.advance(coupling_plan, physical_time);
+                lammps_step_count += coupling_advance.dem_steps;
+                max_lammps_clock_error =
+                    std::max(max_lammps_clock_error, static_cast<Real>(coupling_advance.synchronization_error));
                 dem_state = dem_adapter.pullState();
                 driven_sphere.update(dem_state);
 
@@ -231,7 +243,8 @@ int main(int ac, char *av[])
 
                 final_motion_sample =
                     make_motion_sample(number_of_iterations, lammps_step_count, physical_time, dem_state, driven_sphere.geometricCenter());
-                force_sample = make_force_sample(number_of_iterations, physical_time, dem_state, hydro_force);
+                force_sample = make_force_sample(
+                    number_of_iterations, physical_time, dem_state, hydro_force, hydro_torque);
 
                 write_motion_csv_sample(motion_csv, final_motion_sample);
                 write_force_csv_sample(force_csv, force_sample);
@@ -248,7 +261,13 @@ int main(int ac, char *av[])
                               << "N=" << number_of_iterations
                               << " Time = " << physical_time
                               << " advection_step = " << advection_step
+                              << " acoustic_limit = " << acoustic_limit
                               << " acoustic_step = " << acoustic_step
+                              << " dem_steps = " << coupling_advance.dem_steps
+                              << " lammps_atime = " << coupling_advance.lammps_time
+                              << " driver_time = " << coupling_advance.driver_time
+                              << " driver_lammps_offset = " << coupling_advance.driver_lammps_offset
+                              << " clock_error = " << coupling_advance.synchronization_error
                               << " z = " << dem_state.center[2]
                               << " vz = " << dem_state.velocity[2]
                               << " Fz = " << hydro_force[2] << "\n";
@@ -258,6 +277,8 @@ int main(int ac, char *av[])
                 {
                     output_iteration = number_of_iterations;
                     write_real_body_states.writeToFile(output_iteration);
+                    latest_dem_load_vtp = write_dem_load_to_vtp(
+                        output_iteration, physical_time, dem_state, hydro_force, hydro_torque);
                     next_output_time += kVtpOutputInterval;
                 }
             }
@@ -280,7 +301,8 @@ int main(int ac, char *av[])
         //----------------------------------------------------------------------
         //	Statistics and regression-style checks.
         //----------------------------------------------------------------------
-        const ExternalForce &external_force = dem_adapter.externalForce();
+        const ExternalForceBuffer &external_force = dem_adapter.externalForce();
+        const std::array<double, 3> external_force_value = external_force.forceForId(1);
         const Vec3d pre_entry_mean_force = force_stats.pre_entry_mean_force();
         const Real pre_entry_mean_force_norm = force_stats.pre_entry_mean_force_norm();
         const Real post_entry_max_fz =
@@ -290,11 +312,12 @@ int main(int ac, char *av[])
         std::cout << std::setprecision(17);
         std::cout << "SPHinXsys one-way LAMMPS-driven water-entry example\n";
         std::cout << "Total wall time for computation: " << tt.seconds() << " seconds.\n";
-        std::cout << "liblammps_dll_in_working_directory: " << (std::filesystem::exists(dll_path) ? "yes" : "no") << '\n';
+        std::cout << "lammps_runtime_in_working_directory: " << (std::filesystem::exists(runtime_path) ? "yes" : "no") << '\n';
         std::cout << "lammps_version: " << dem_adapter.version() << '\n';
         std::cout << "sphere_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
         std::cout << "sphere_force_csv: " << std::filesystem::absolute(force_csv_path).string() << '\n';
         std::cout << "VTP_output_folder: " << output_path.string() << '\n';
+        std::cout << "DEM_load_vtp_latest: " << std::filesystem::absolute(latest_dem_load_vtp).string() << '\n';
         std::cout << "reload_file: " << std::filesystem::absolute(reload_particle_file()).string() << '\n';
         std::cout << "sphere_particle_source: " << sphere_particle_source << '\n';
         std::cout << "water_particles: " << water_block.getBaseParticles().TotalRealParticles() << '\n';
@@ -304,14 +327,16 @@ int main(int ac, char *av[])
         std::cout << "advection_iterations: " << advection_iterations << '\n';
         std::cout << "number_of_iterations: " << number_of_iterations << '\n';
         std::cout << "lammps_substeps_executed: " << lammps_step_count << '\n';
+        std::cout << "max_lammps_clock_error_s: " << max_lammps_clock_error << '\n';
+        std::cout << "hydrodynamic_torque_feedback_enabled: no\n";
         std::cout << "entry_time_s: " << water_entry_time() << '\n';
         std::cout << "end_time_s: " << kEndTime << '\n';
         std::cout << "external_force_feedback_N: "
-                  << external_force.force[0] << ','
-                  << external_force.force[1] << ','
-                  << external_force.force[2] << '\n';
-        std::cout << "callback_calls: " << external_force.callback_calls << '\n';
-        std::cout << "atom1_force_updates: " << external_force.atom1_updates << '\n';
+                  << external_force_value[0] << ','
+                  << external_force_value[1] << ','
+                  << external_force_value[2] << '\n';
+        std::cout << "callback_calls: " << external_force.callbackCalls() << '\n';
+        std::cout << "atom1_force_updates: " << external_force.atomUpdates() << '\n';
         std::cout << "final_lammps_center_m: "
                   << final_motion_sample.dem_state.center[0] << ','
                   << final_motion_sample.dem_state.center[1] << ','
@@ -335,17 +360,23 @@ int main(int ac, char *av[])
         std::cout << "post_entry_samples: " << force_stats.post_entry_count << '\n';
         std::cout << "post_entry_max_Fz_N: " << post_entry_max_fz << '\n';
 
-        if (!std::filesystem::exists(dll_path))
+        if (!std::filesystem::exists(runtime_path))
         {
-            std::cerr << "ERROR: liblammps.dll was not copied next to the executable.\n";
+            std::cerr << "ERROR: the LAMMPS runtime library was not staged next to the executable.\n";
             return 1;
         }
-        if (external_force.callback_calls <= 0 || external_force.atom1_updates <= 0)
+        if (!std::filesystem::exists(latest_dem_load_vtp))
+        {
+            std::cerr << "ERROR: the 3D DEM load VTP file was not written.\n";
+            return 1;
+        }
+        if (external_force.callbackCalls() <= 0 || external_force.atomUpdates() <= 0)
         {
             std::cerr << "ERROR: fix external callback did not update atom id=1.\n";
             return 1;
         }
-        if (external_force.force[0] != 0.0 || external_force.force[1] != 0.0 || external_force.force[2] != 0.0)
+        if (external_force_value[0] != 0.0 || external_force_value[1] != 0.0 ||
+            external_force_value[2] != 0.0)
         {
             std::cerr << "ERROR: hydrodynamic force feedback to LAMMPS is not disabled.\n";
             return 1;

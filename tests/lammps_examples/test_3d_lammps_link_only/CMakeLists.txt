@@ -9,6 +9,7 @@ target_sources(${PROJECT_NAME} PRIVATE
     test_3d_lammps_link_only.h)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
 target_link_libraries(${PROJECT_NAME} PRIVATE sphinxsys_lammps_examples_common)
+sphinxsys_configure_lammps_example(${PROJECT_NAME})
 set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${EXECUTABLE_OUTPUT_PATH}"
@@ -17,16 +18,8 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_MINSIZEREL "${EXECUTABLE_OUTPUT_PATH}"
     VS_DEBUGGER_WORKING_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
 
-add_custom_command(
-    TARGET ${PROJECT_NAME}
-    POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${SPHINXSYS_LAMMPS_DLL}"
-            "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
-    COMMENT "Copying liblammps.dll next to ${PROJECT_NAME}")
-
 add_test(NAME ${PROJECT_NAME}
     COMMAND ${PROJECT_NAME}
     WORKING_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
 
-set_tests_properties(${PROJECT_NAME} PROPERTIES LABELS "lammps")
+set_tests_properties(${PROJECT_NAME} PROPERTIES LABELS "lammps;fast")

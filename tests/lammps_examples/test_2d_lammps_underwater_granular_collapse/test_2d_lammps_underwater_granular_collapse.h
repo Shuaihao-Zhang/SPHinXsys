@@ -2,6 +2,7 @@
 
 #include "sphinxsys.h"
 #include "lammps_instance.h"
+#include "lammps_dem_adapter_common.h"
 #include "lammps_io.h"
 
 #include <algorithm>
@@ -25,6 +26,14 @@ using namespace SPH;
 namespace LammpsUnderwaterGranularCollapse2D
 {
 using SPH::lammps_examples::LammpsInstance;
+using SPH::lammps_examples::CouplingAdvanceResult;
+using SPH::lammps_examples::CouplingStepPlan;
+using SPH::lammps_examples::ExternalForceBuffer;
+using SPH::lammps_examples::LammpsTimeIntegrator;
+using SPH::lammps_examples::ParticleForce;
+using SPH::lammps_examples::makeCouplingStepPlan;
+using SPH::lammps_examples::extract_atom_vector3_by_consecutive_id;
+using SPH::lammps_examples::validate_consecutive_atom_ids;
 using SPH::lammps_examples::VtpPvdWriter;
 using SPH::lammps_examples::VtpScalarPointField;
 using SPH::lammps_examples::VtpVectorPointField2d;
@@ -51,12 +60,14 @@ inline constexpr int kCircleShapeResolution = 96;
 inline constexpr Real kEndTime = 1.0;
 inline constexpr Real kFluidRelaxationTime = 0.0;
 inline constexpr Real kVtpOutputInterval = 0.01;
+inline constexpr int kCsvOutputStride = 20;
 inline constexpr double kDemMaxDt = 1.0e-5;
 inline constexpr int kRelaxationSteps = 1000;
 inline constexpr int kWaterRelaxationSteps = 1;
 inline constexpr int kRelaxationOutputInterval = 200;
 inline constexpr Real kForceRelaxationAlpha = 0.3;
 inline constexpr Real kForceCapWeightFactor = 5.0;
+inline constexpr Real kOutOfPlaneDepth = 1.0;
 
 inline constexpr Real kWaterDensity = 1000.0;
 inline constexpr Real kGrainDensity = 2500.0;
@@ -262,13 +273,6 @@ struct DEMParticleState
     Real omega_z = 0.0;
 };
 
-struct ExternalForceTable
-{
-    std::array<std::array<double, 3>, kParticleCount + 1> force_by_id{};
-    int callback_calls = 0;
-    int atom_updates = 0;
-};
-
 inline Real grain_area()
 {
     return Pi * kGrainRadius * kGrainRadius;
@@ -276,7 +280,7 @@ inline Real grain_area()
 
 inline Real grain_mass()
 {
-    return kGrainDensity * grain_area();
+    return kGrainDensity * grain_area() * kOutOfPlaneDepth;
 }
 
 inline Real grain_weight()
@@ -309,39 +313,6 @@ inline Real initial_right_front_x()
         right_front = std::max(right_front, center[0] + kGrainRadius);
     }
     return right_front;
-}
-
-#if defined(LAMMPS_BIGBIG)
-using tagint_c = int64_t;
-#else
-using tagint_c = int;
-#endif
-
-extern "C" void external_force_callback(void *ptr,
-                                         int64_t /*timestep*/,
-                                         int nlocal,
-                                         tagint_c *ids,
-                                         double ** /*x*/,
-                                         double **fexternal)
-{
-    auto *external = static_cast<ExternalForceTable *>(ptr);
-    ++external->callback_calls;
-
-    for (int i = 0; i < nlocal; ++i)
-    {
-        fexternal[i][0] = 0.0;
-        fexternal[i][1] = 0.0;
-        fexternal[i][2] = 0.0;
-
-        const int id = static_cast<int>(ids[i]);
-        if (id >= 1 && id <= kParticleCount)
-        {
-            fexternal[i][0] = external->force_by_id[id][0];
-            fexternal[i][1] = external->force_by_id[id][1];
-            fexternal[i][2] = 0.0;
-            ++external->atom_updates;
-        }
-    }
 }
 
 class LammpsGranularColumnAdapter
@@ -396,53 +367,27 @@ class LammpsGranularColumnAdapter
              << "thermo 1000000\n";
 
         lammps_.commands_string(cmds.str(), "LAMMPS initialization commands");
-        lammps_set_fix_external_callback(lammps_.get(), "ext", &external_force_callback, &external_force_);
-        lammps_.throw_if_error("lammps_set_fix_external_callback");
+        external_force_.registerFix(lammps_, "ext");
     }
 
-    void runSubsteps(int steps)
+    CouplingStepPlan planCouplingStep(Real acoustic_limit) const
     {
-        if (steps <= 0)
-        {
-            return;
-        }
-        lammps_.command("run " + std::to_string(steps) + " post no", "LAMMPS run chunk");
+        return makeCouplingStepPlan(acoustic_limit, kDemMaxDt);
     }
 
-    void setTimestep(double dem_timestep)
+    CouplingAdvanceResult advance(const CouplingStepPlan &plan)
     {
-        std::ostringstream cmd;
-        cmd << std::setprecision(17) << "timestep " << dem_timestep;
-        lammps_.command(cmd.str(), "LAMMPS timestep update");
+        return time_integrator_.advance(plan);
+    }
+
+    CouplingAdvanceResult advance(const CouplingStepPlan &plan, Real driver_time_before)
+    {
+        return time_integrator_.advance(plan, driver_time_before);
     }
 
     int runForDuration(Real acoustic_step)
     {
-        if (acoustic_step <= TinyReal)
-        {
-            return 0;
-        }
-
-        const int full_steps = static_cast<int>(std::floor(acoustic_step / kDemMaxDt));
-        const Real remainder = acoustic_step - static_cast<Real>(full_steps) * kDemMaxDt;
-        int executed_steps = 0;
-
-        if (full_steps > 0)
-        {
-            setTimestep(kDemMaxDt);
-            runSubsteps(full_steps);
-            executed_steps += full_steps;
-        }
-
-        if (remainder > TinyReal)
-        {
-            setTimestep(remainder);
-            runSubsteps(1);
-            setTimestep(kDemMaxDt);
-            executed_steps += 1;
-        }
-
-        return executed_steps;
+        return advance(planCouplingStep(acoustic_step)).dem_steps;
     }
 
     void setExternalForces(const std::vector<Vec2d> &forces)
@@ -452,13 +397,14 @@ class LammpsGranularColumnAdapter
             throw std::runtime_error("hydrodynamic force vector size does not match DEM particle count");
         }
 
+        std::vector<ParticleForce> particle_forces;
+        particle_forces.reserve(kParticleCount);
         for (int id = 1; id <= kParticleCount; ++id)
         {
             const Vec2d &force = forces[id - 1];
-            external_force_.force_by_id[id][0] = force[0];
-            external_force_.force_by_id[id][1] = force[1];
-            external_force_.force_by_id[id][2] = 0.0;
+            particle_forces.push_back(ParticleForce{id, {force[0], force[1], 0.0}});
         }
+        external_force_.setForces(particle_forces);
     }
 
     Real particleMass() const
@@ -474,19 +420,16 @@ class LammpsGranularColumnAdapter
 
     std::vector<DEMParticleState> pullStates() const
     {
+        validate_consecutive_atom_ids(lammps_, kParticleCount);
         std::array<double, 3 * kParticleCount> x{};
         std::array<double, 3 * kParticleCount> v{};
         std::array<double, 3 * kParticleCount> f{};
         std::array<double, 3 * kParticleCount> omega{};
 
-        lammps_gather_atoms(lammps_.get(), "x", 1, 3, x.data());
-        lammps_.throw_if_error("gather atom positions");
-        lammps_gather_atoms(lammps_.get(), "v", 1, 3, v.data());
-        lammps_.throw_if_error("gather atom velocities");
-        lammps_gather_atoms(lammps_.get(), "f", 1, 3, f.data());
-        lammps_.throw_if_error("gather atom forces");
-        lammps_gather_atoms(lammps_.get(), "omega", 1, 3, omega.data());
-        lammps_.throw_if_error("gather atom angular velocities");
+        extract_atom_vector3_by_consecutive_id(lammps_, "x", kParticleCount, x.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "v", kParticleCount, v.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "f", kParticleCount, f.data());
+        extract_atom_vector3_by_consecutive_id(lammps_, "omega", kParticleCount, omega.data());
 
         std::vector<DEMParticleState> states;
         states.reserve(kParticleCount);
@@ -505,11 +448,12 @@ class LammpsGranularColumnAdapter
 
     int version() const { return lammps_.version(); }
 
-    const ExternalForceTable &externalForceTable() const { return external_force_; }
+    const ExternalForceBuffer &externalForceTable() const { return external_force_; }
 
   private:
+    ExternalForceBuffer external_force_;
     LammpsInstance lammps_;
-    ExternalForceTable external_force_;
+    LammpsTimeIntegrator time_integrator_{lammps_, kDemMaxDt};
 };
 
 class DrivenGranularColumnBoundary
@@ -572,7 +516,9 @@ class DrivenGranularColumnBoundary
         {
             const int id = particle_dem_ids_[i];
             pos_[i] = states[id].center + relative_positions_[i];
-            vel_[i] = states[id].velocity;
+            vel_[i] = states[id].velocity +
+                      Vec2d(-states[id].omega_z * relative_positions_[i][1],
+                            states[id].omega_z * relative_positions_[i][0]);
             acc_[i] = states[id].acceleration;
         }
         column_body_.setNewlyUpdated();
@@ -641,7 +587,7 @@ inline void update_water_grain_configuration(FluidBody &water_block,
 }
 
 inline std::vector<Vec2d> sum_grain_hydro_forces(SPHBody &grain_boundary,
-                                                 const std::vector<int> &particle_dem_ids)
+                                                  const std::vector<int> &particle_dem_ids)
 {
     BaseParticles &particles = grain_boundary.getBaseParticles();
     Vecd *pressure_force = particles.getVariableDataByName<Vecd>("PressureForceFromFluid");
@@ -654,6 +600,27 @@ inline std::vector<Vec2d> sum_grain_hydro_forces(SPHBody &grain_boundary,
         forces[particle_dem_ids[i]] += Vec2d(particle_force[0], particle_force[1]);
     }
     return forces;
+}
+
+inline std::vector<Real> sum_grain_hydro_torques(
+    SPHBody &grain_boundary, const std::vector<int> &particle_dem_ids,
+    const std::vector<DEMParticleState> &states)
+{
+    BaseParticles &particles = grain_boundary.getBaseParticles();
+    Vecd *positions = particles.ParticlePositions();
+    Vecd *pressure_force = particles.getVariableDataByName<Vecd>("PressureForceFromFluid");
+    Vecd *viscous_force = particles.getVariableDataByName<Vecd>("ViscousForceFromFluid");
+
+    std::vector<Real> torques(kParticleCount, 0.0);
+    for (UnsignedInt i = 0; i != particles.TotalRealParticles(); ++i)
+    {
+        const int dem_id = particle_dem_ids[i];
+        const Vec2d relative_position = positions[i] - states[dem_id].center;
+        const Vecd particle_force = pressure_force[i] + viscous_force[i];
+        torques[dem_id] += relative_position[0] * particle_force[1] -
+                           relative_position[1] * particle_force[0];
+    }
+    return torques;
 }
 
 inline Real max_center_sync_error(const std::vector<DEMParticleState> &states,
@@ -934,7 +901,8 @@ inline std::filesystem::path write_dem_force_vtp(int iteration,
                                                  Real time,
                                                  const std::vector<DEMParticleState> &states,
                                                  const std::vector<Vec2d> &raw_hydro_forces,
-                                                 const std::vector<Vec2d> &applied_hydro_forces)
+                                                 const std::vector<Vec2d> &applied_hydro_forces,
+                                                 const std::vector<Real> &raw_hydrodynamic_torques)
 {
     return write_dem_points_fields_to_vtp(
         iteration,
@@ -946,7 +914,8 @@ inline std::filesystem::path write_dem_force_vtp(int iteration,
          {"Velocity", velocities_from_states(states)}},
         {{"ParticleId", ids_as_scalars()},
          {"Radius", scalar_filled(kGrainRadius)},
-         {"MassPerUnitDepth", scalar_filled(grain_mass())}},
+         {"MassPerUnitDepth", scalar_filled(grain_mass())},
+         {"HydrodynamicTorqueRawPerUnitDepth", raw_hydrodynamic_torques}},
         "HydrodynamicForceApplied");
 }
 
@@ -960,9 +929,9 @@ inline void write_motion_csv_header(std::ofstream &csv)
 inline void write_force_csv_header(std::ofstream &csv)
 {
     csv << "frame,time_s,relaxation_phase,coupling_active,particle_id,"
-           "Fx_raw_N,Fy_raw_N,raw_force_norm_N,"
-           "Fx_applied_N,Fy_applied_N,applied_force_norm_N,"
-           "grain_weight_N,force_cap_N,capped\n";
+           "Fx_raw_N_per_m,Fy_raw_N_per_m,raw_force_norm_N_per_m,"
+           "Fx_applied_N_per_m,Fy_applied_N_per_m,applied_force_norm_N_per_m,"
+           "raw_hydrodynamic_torque_Nm_per_m,grain_weight_N_per_m,force_cap_N_per_m,capped\n";
 }
 
 inline void write_motion_csv_samples(std::ofstream &csv,
@@ -997,10 +966,11 @@ inline void write_motion_csv_samples(std::ofstream &csv,
 inline void write_force_csv_samples(std::ofstream &csv,
                                     int frame,
                                     Real time,
-                                    bool coupling_active,
-                                    const std::vector<Vec2d> &raw_hydro_forces,
-                                    const std::vector<Vec2d> &applied_hydro_forces,
-                                    const std::vector<int> &capped_flags)
+                                     bool coupling_active,
+                                     const std::vector<Vec2d> &raw_hydro_forces,
+                                     const std::vector<Vec2d> &applied_hydro_forces,
+                                     const std::vector<Real> &raw_hydrodynamic_torques,
+                                     const std::vector<int> &capped_flags)
 {
     const int relaxation_phase = coupling_active ? 0 : 1;
     for (int i = 0; i < kParticleCount; ++i)
@@ -1016,6 +986,7 @@ inline void write_force_csv_samples(std::ofstream &csv,
             << applied_hydro_forces[i][0] << ','
             << applied_hydro_forces[i][1] << ','
             << applied_hydro_forces[i].norm() << ','
+            << raw_hydrodynamic_torques[i] << ','
             << grain_weight() << ','
             << kForceCapWeightFactor * grain_weight() << ','
             << capped_flags[i] << '\n';

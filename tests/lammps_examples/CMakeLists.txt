@@ -1,44 +1,45 @@
+if(SPHINXSYS_3D)
+    add_subdirectory(test_3d_fixed_sphere_hydro_force)
+endif()
+
 if(NOT SPHINXSYS_WITH_LAMMPS)
-    message(STATUS "Skipping LAMMPS examples because SPHINXSYS_WITH_LAMMPS is OFF")
+    message(STATUS "Skipping LAMMPS-linked examples because SPHINXSYS_WITH_LAMMPS is OFF")
     return()
 endif()
 
-get_filename_component(SPH_DEM_ROOT "${SPHINXSYS_PROJECT_DIR}/.." ABSOLUTE)
-
-set(SPHINXSYS_LAMMPS_INCLUDE_DIR
-    "${SPH_DEM_ROOT}/lammps_build/includes/lammps"
-    CACHE PATH "Path to LAMMPS generated C library headers")
-set(SPHINXSYS_LAMMPS_LIBRARY
-    "${SPH_DEM_ROOT}/lammps_build/Release/lammps.lib"
-    CACHE FILEPATH "Path to LAMMPS import library")
-set(SPHINXSYS_LAMMPS_DLL
-    "${SPH_DEM_ROOT}/lammps_build/Release/liblammps.dll"
-    CACHE FILEPATH "Path to LAMMPS runtime DLL")
-
-if(NOT EXISTS "${SPHINXSYS_LAMMPS_INCLUDE_DIR}/library.h")
-    message(FATAL_ERROR "LAMMPS library.h not found: ${SPHINXSYS_LAMMPS_INCLUDE_DIR}/library.h")
+if(NOT TARGET SPHinXsys::sphinxsys_lammps)
+    message(FATAL_ERROR "SPHinXsys::sphinxsys_lammps is required by LAMMPS examples")
 endif()
 
-if(NOT EXISTS "${SPHINXSYS_LAMMPS_LIBRARY}")
-    message(FATAL_ERROR "LAMMPS import library not found: ${SPHINXSYS_LAMMPS_LIBRARY}")
-endif()
-
-if(NOT EXISTS "${SPHINXSYS_LAMMPS_DLL}")
-    message(FATAL_ERROR "LAMMPS runtime DLL not found: ${SPHINXSYS_LAMMPS_DLL}")
-endif()
-
-add_library(LAMMPS::lammps SHARED IMPORTED)
-set_target_properties(LAMMPS::lammps PROPERTIES
-    IMPORTED_IMPLIB "${SPHINXSYS_LAMMPS_LIBRARY}"
-    IMPORTED_LOCATION "${SPHINXSYS_LAMMPS_DLL}"
-    INTERFACE_INCLUDE_DIRECTORIES "${SPHINXSYS_LAMMPS_INCLUDE_DIR}")
+function(sphinxsys_configure_lammps_example target_name)
+    target_link_libraries(${target_name} PRIVATE SPHinXsys::sphinxsys_lammps)
+    target_compile_definitions(${target_name} PRIVATE
+        SPHINXSYS_LAMMPS_RUNTIME_FILENAME="$<TARGET_FILE_NAME:LAMMPS::lammps>")
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:LAMMPS::lammps>"
+                "$<TARGET_FILE_DIR:${target_name}>"
+        COMMENT "Staging the LAMMPS runtime library next to ${target_name}")
+    if(APPLE)
+        set_property(TARGET ${target_name} APPEND PROPERTY
+            BUILD_RPATH "@loader_path")
+    elseif(UNIX)
+        set_property(TARGET ${target_name} APPEND PROPERTY
+            BUILD_RPATH "$ORIGIN")
+    endif()
+endfunction()
 
 add_subdirectory(common)
 
-SUBDIRLIST(SUBDIRS ${CMAKE_CURRENT_SOURCE_DIR})
+if(SPHINXSYS_2D)
+    add_subdirectory(test_2d_lammps_granular_collapse)
+    add_subdirectory(test_2d_lammps_two_way_water_entry)
+    add_subdirectory(test_2d_lammps_underwater_granular_collapse)
+endif()
 
-foreach(subdir ${SUBDIRS})
-    if(NOT "${subdir}" STREQUAL "common" AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/CMakeLists.txt)
-	    add_subdirectory(${subdir})
-    endif()
-endforeach()
+if(SPHINXSYS_3D)
+    add_subdirectory(test_3d_lammps_driven_sphere)
+    add_subdirectory(test_3d_lammps_link_only)
+    add_subdirectory(test_3d_lammps_one_way_water_entry)
+    add_subdirectory(test_3d_lammps_two_way_water_entry)
+endif()
