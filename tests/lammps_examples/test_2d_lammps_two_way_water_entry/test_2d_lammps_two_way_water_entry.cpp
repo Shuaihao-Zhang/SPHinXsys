@@ -20,7 +20,7 @@ int main(int ac, char *av[])
         //----------------------------------------------------------------------
         SPHSystem sph_system(kSystemDomainBounds, kParticleSpacing);
         sph_system.setRunParticleRelaxation(false);
-        sph_system.setReloadParticles(reload_particle_file_exists());
+        sph_system.setReloadParticles(false);
         sph_system.handleCommandlineOptions(ac, av);
 
         if (sph_system.RunParticleRelaxation())
@@ -126,6 +126,11 @@ int main(int ac, char *av[])
         const std::filesystem::path force_csv_path = "cylinder_force.csv";
         const std::filesystem::path dll_path = "liblammps.dll";
         const std::filesystem::path output_path = std::filesystem::absolute(IO::getEnvironment().OutputFolder());
+        VtpPvdWriter water_body_pvd("WaterBody");
+        VtpPvdWriter wall_boundary_pvd("WallBoundary");
+        VtpPvdWriter cylinder_proxy_pvd("LammpsTwoWayWaterEntryCylinder");
+        VtpPvdWriter dem_cylinder_pvd("DEM_Cylinder");
+        VtpPvdWriter dem_force_pvd("DEM_Force");
         auto output_file_exists_with_prefix = [](const std::filesystem::path &folder,
                                                  const std::string &prefix) -> bool
         {
@@ -203,10 +208,15 @@ int main(int ac, char *av[])
         finite_state = finite_state && is_finite(dem_state.center) && is_finite(dem_state.velocity) &&
                        is_finite(raw_force) && is_finite(previous_applied_force);
         write_real_body_states.writeToFile(0);
+        water_body_pvd.add(physical_time, lammps_example_output_path("WaterBody", 0));
+        wall_boundary_pvd.add(physical_time, lammps_example_output_path("WallBoundary", 0));
+        cylinder_proxy_pvd.add(physical_time, lammps_example_output_path("LammpsTwoWayWaterEntryCylinder", 0));
         std::filesystem::path latest_dem_cylinder_vtp =
             write_dem_cylinder_to_vtp(0, physical_time, dem_state.center, kCylinderRadius);
         std::filesystem::path latest_dem_force_vtp =
             write_dem_force_to_vtp(0, physical_time, dem_state, raw_force, previous_applied_force);
+        dem_cylinder_pvd.add(physical_time, latest_dem_cylinder_vtp);
+        dem_force_pvd.add(physical_time, latest_dem_force_vtp);
         int dem_visualization_output_count = 1;
 
         //----------------------------------------------------------------------
@@ -292,10 +302,14 @@ int main(int ac, char *av[])
                 {
                     output_iteration = number_of_iterations;
                     write_real_body_states.writeToFile(output_iteration);
+                    water_body_pvd.add(physical_time, lammps_example_output_path("WaterBody", output_iteration));
+                    cylinder_proxy_pvd.add(physical_time, lammps_example_output_path("LammpsTwoWayWaterEntryCylinder", output_iteration));
                     latest_dem_cylinder_vtp =
                         write_dem_cylinder_to_vtp(output_iteration, physical_time, dem_state.center, kCylinderRadius);
                     latest_dem_force_vtp =
                         write_dem_force_to_vtp(output_iteration, physical_time, dem_state, raw_force, previous_applied_force);
+                    dem_cylinder_pvd.add(physical_time, latest_dem_cylinder_vtp);
+                    dem_force_pvd.add(physical_time, latest_dem_force_vtp);
                     ++dem_visualization_output_count;
                     next_output_time += kVtpOutputInterval;
                 }
@@ -343,6 +357,11 @@ int main(int ac, char *av[])
         std::cout << "cylinder_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
         std::cout << "cylinder_force_csv: " << std::filesystem::absolute(force_csv_path).string() << '\n';
         std::cout << "VTP_output_folder: " << output_path.string() << '\n';
+        std::cout << "WaterBody_pvd: " << std::filesystem::absolute(water_body_pvd.path()).string() << '\n';
+        std::cout << "WallBoundary_pvd: " << std::filesystem::absolute(wall_boundary_pvd.path()).string() << '\n';
+        std::cout << "SPH_cylinder_proxy_pvd: " << std::filesystem::absolute(cylinder_proxy_pvd.path()).string() << '\n';
+        std::cout << "DEM_cylinder_pvd: " << std::filesystem::absolute(dem_cylinder_pvd.path()).string() << '\n';
+        std::cout << "DEM_force_pvd: " << std::filesystem::absolute(dem_force_pvd.path()).string() << '\n';
         std::cout << "DEM_cylinder_vtp_latest: " << std::filesystem::absolute(latest_dem_cylinder_vtp).string() << '\n';
         std::cout << "DEM_force_vtp_latest: " << std::filesystem::absolute(latest_dem_force_vtp).string() << '\n';
         std::cout << "DEM_visualization_output_count: " << dem_visualization_output_count << '\n';
@@ -489,6 +508,15 @@ int main(int ac, char *av[])
         if (!std::filesystem::exists(latest_dem_cylinder_vtp) || !std::filesystem::exists(latest_dem_force_vtp))
         {
             std::cerr << "ERROR: latest DEM visualization VTP file is missing.\n";
+            return 1;
+        }
+        if (!std::filesystem::exists(water_body_pvd.path()) ||
+            !std::filesystem::exists(wall_boundary_pvd.path()) ||
+            !std::filesystem::exists(cylinder_proxy_pvd.path()) ||
+            !std::filesystem::exists(dem_cylinder_pvd.path()) ||
+            !std::filesystem::exists(dem_force_pvd.path()))
+        {
+            std::cerr << "ERROR: one or more PVD time-series files were not written.\n";
             return 1;
         }
 

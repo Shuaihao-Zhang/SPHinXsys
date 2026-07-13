@@ -33,10 +33,12 @@ set_target_properties(LAMMPS::lammps PROPERTIES
     IMPORTED_LOCATION "${SPHINXSYS_LAMMPS_DLL}"
     INTERFACE_INCLUDE_DIRECTORIES "${SPHINXSYS_LAMMPS_INCLUDE_DIR}")
 
+add_subdirectory(common)
+
 SUBDIRLIST(SUBDIRS ${CMAKE_CURRENT_SOURCE_DIR})
 
 foreach(subdir ${SUBDIRS})
-    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/CMakeLists.txt)
+    if(NOT "${subdir}" STREQUAL "common" AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${subdir}/CMakeLists.txt)
 	    add_subdirectory(${subdir})
     endif()
 endforeach()

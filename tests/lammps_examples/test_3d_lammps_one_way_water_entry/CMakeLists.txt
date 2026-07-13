@@ -8,7 +8,7 @@ target_sources(${PROJECT_NAME} PRIVATE
     test_3d_lammps_one_way_water_entry.cpp
     test_3d_lammps_one_way_water_entry.h)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
-target_link_libraries(${PROJECT_NAME} PRIVATE sphinxsys_3d LAMMPS::lammps)
+target_link_libraries(${PROJECT_NAME} PRIVATE sphinxsys_3d sphinxsys_lammps_examples_common)
 set_target_properties(${PROJECT_NAME} PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}"
     RUNTIME_OUTPUT_DIRECTORY_DEBUG "${EXECUTABLE_OUTPUT_PATH}"

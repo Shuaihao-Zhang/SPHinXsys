@@ -1,7 +1,7 @@
 #pragma once
 
 #include "sphinxsys.h"
-#include "library.h"
+#include "lammps_instance.h"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +22,7 @@ using namespace SPH;
 
 namespace LammpsTwoWayWaterEntry
 {
+using SPH::lammps_examples::LammpsInstance;
 //----------------------------------------------------------------------
 //	Basic geometry parameters and numerical setup.
 //----------------------------------------------------------------------
@@ -41,6 +42,16 @@ inline constexpr int kRelaxationSteps = 1000;
 inline constexpr int kRelaxationOutputInterval = 200;
 inline constexpr Real kForceRelaxationAlpha = 0.3;
 inline constexpr Real kForceCapWeightFactor = 5.0;
+inline constexpr Real kWallXMin = 0.0;
+inline constexpr Real kWallXMax = kTankLengthX;
+inline constexpr Real kWallYMin = 0.0;
+inline constexpr Real kWallYMax = kTankLengthY;
+inline constexpr Real kBottomWallZ = 0.0;
+inline constexpr Real kContactNormalStiffness = 5.0e4;
+inline constexpr Real kContactRestitution = 0.2;
+inline constexpr Real kContactTangentialStiffness = 4.0e4;
+inline constexpr Real kContactTangentialDamping = 0.0;
+inline constexpr Real kContactFriction = 0.5;
 //----------------------------------------------------------------------
 //	Material parameters.
 //----------------------------------------------------------------------
@@ -181,67 +192,6 @@ inline Vec3d to_vec3d(const std::array<double, 3> &values)
     return Vec3d(values[0], values[1], values[2]);
 }
 
-class LammpsInstance
-{
-  public:
-    LammpsInstance()
-    {
-        const char *args[] = {"liblammps", "-log", "none", "-screen", "none", "-nocite", nullptr};
-        auto **argv = const_cast<char **>(args);
-        const int argc = static_cast<int>((sizeof(args) / sizeof(char *)) - 1);
-
-        handle_ = lammps_open_no_mpi(argc, argv, nullptr);
-        if (handle_ == nullptr)
-        {
-            throw std::runtime_error("lammps_open_no_mpi returned null");
-        }
-    }
-
-    LammpsInstance(const LammpsInstance &) = delete;
-    LammpsInstance &operator=(const LammpsInstance &) = delete;
-
-    ~LammpsInstance()
-    {
-        if (handle_ != nullptr)
-        {
-            lammps_close(handle_);
-        }
-    }
-
-    void *get() const { return handle_; }
-
-    int version() const { return lammps_version(handle_); }
-
-    void command(const std::string &cmd, const std::string &context) const
-    {
-        lammps_command(handle_, cmd.c_str());
-        throw_if_error(context);
-    }
-
-    void commands_string(const std::string &cmds, const std::string &context) const
-    {
-        lammps_commands_string(handle_, cmds.c_str());
-        throw_if_error(context);
-    }
-
-    void throw_if_error(const std::string &context) const
-    {
-        if (lammps_has_error(handle_) == 0)
-        {
-            return;
-        }
-
-        char buffer[4096] = {};
-        lammps_get_last_error_message(handle_, buffer, static_cast<int>(sizeof(buffer)));
-        std::ostringstream msg;
-        msg << context << " failed: " << buffer;
-        throw std::runtime_error(msg.str());
-    }
-
-  private:
-    void *handle_ = nullptr;
-};
-
 class LammpsDEMAdapter
 {
   public:
@@ -266,13 +216,32 @@ class LammpsDEMAdapter
              << "set atom 1 diameter " << kSphereDiameter
              << " density " << kSphereDensity << "\n"
              << "velocity all set 0.0 0.0 0.0 units box\n"
-             << "pair_style zero 0.1\n"
-             << "pair_coeff * *\n"
+             << "pair_style granular\n"
+             << "pair_coeff * * hooke " << kContactNormalStiffness << ' '
+             << kContactRestitution
+             << " tangential linear_history " << kContactTangentialStiffness << ' '
+             << kContactTangentialDamping << ' ' << kContactFriction
+             << " damping coeff_restitution\n"
              << "neighbor 0.01 bin\n"
              << "neigh_modify delay 0 every 1 check yes\n"
              << "fix int all nve/sphere\n"
              << "fix grav all gravity " << kGravity << " vector 0.0 0.0 -1.0\n"
              << "fix ext all external pf/callback 1 1\n"
+             << "fix xwall all wall/gran granular hooke " << kContactNormalStiffness << ' '
+             << kContactRestitution
+             << " tangential linear_history " << kContactTangentialStiffness << ' '
+             << kContactTangentialDamping << ' ' << kContactFriction
+             << " damping coeff_restitution xplane " << kWallXMin << ' ' << kWallXMax << " contacts\n"
+             << "fix ywall all wall/gran granular hooke " << kContactNormalStiffness << ' '
+             << kContactRestitution
+             << " tangential linear_history " << kContactTangentialStiffness << ' '
+             << kContactTangentialDamping << ' ' << kContactFriction
+             << " damping coeff_restitution yplane " << kWallYMin << ' ' << kWallYMax << " contacts\n"
+             << "fix floor all wall/gran granular hooke " << kContactNormalStiffness << ' '
+             << kContactRestitution
+             << " tangential linear_history " << kContactTangentialStiffness << ' '
+             << kContactTangentialDamping << ' ' << kContactFriction
+             << " damping coeff_restitution zplane " << kBottomWallZ << " NULL contacts\n"
              << "timestep " << kDemMaxDt << "\n"
              << "thermo 1000000\n";
 
@@ -555,6 +524,20 @@ inline Real sphere_weight()
 inline Real water_entry_time()
 {
     return std::sqrt(2.0 * kInitialClearance / kGravity);
+}
+
+inline Real bottom_wall_overlap(const Vec3d &center)
+{
+    return SMAX(Real(0), kBottomWallZ - (center[2] - kSphereRadius));
+}
+
+inline Real tank_wall_overlap(const Vec3d &center)
+{
+    const Real xlo_overlap = SMAX(Real(0), kWallXMin - (center[0] - kSphereRadius));
+    const Real xhi_overlap = SMAX(Real(0), (center[0] + kSphereRadius) - kWallXMax);
+    const Real ylo_overlap = SMAX(Real(0), kWallYMin - (center[1] - kSphereRadius));
+    const Real yhi_overlap = SMAX(Real(0), (center[1] + kSphereRadius) - kWallYMax);
+    return SMAX(bottom_wall_overlap(center), SMAX(SMAX(xlo_overlap, xhi_overlap), SMAX(ylo_overlap, yhi_overlap)));
 }
 
 inline bool is_finite(const Vec3d &value)

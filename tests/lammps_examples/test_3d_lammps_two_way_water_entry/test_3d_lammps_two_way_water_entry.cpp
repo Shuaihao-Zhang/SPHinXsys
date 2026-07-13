@@ -161,6 +161,7 @@ int main(int ac, char *av[])
         Real max_center_error = 0.0;
         Real max_abs_z_minus_freefall = 0.0;
         Real max_abs_vz_minus_freefall = 0.0;
+        Real max_wall_contact_overlap = 0.0;
         bool finite_state = true;
         ForceStats force_stats;
         MotionSample final_motion_sample;
@@ -179,6 +180,7 @@ int main(int ac, char *av[])
         write_motion_csv_sample(motion_csv, final_motion_sample);
         write_force_csv_sample(force_csv, force_sample);
         max_center_error = std::max(max_center_error, final_motion_sample.center_error);
+        max_wall_contact_overlap = std::max(max_wall_contact_overlap, tank_wall_overlap(dem_state.center));
         force_stats.add(force_sample);
         finite_state = finite_state && is_finite(dem_state.center) && is_finite(dem_state.velocity) &&
                        is_finite(raw_force) && is_finite(previous_applied_force);
@@ -246,6 +248,7 @@ int main(int ac, char *av[])
                 write_force_csv_sample(force_csv, force_sample);
 
                 max_center_error = std::max(max_center_error, final_motion_sample.center_error);
+                max_wall_contact_overlap = std::max(max_wall_contact_overlap, tank_wall_overlap(dem_state.center));
                 max_abs_z_minus_freefall =
                     std::max(max_abs_z_minus_freefall, std::abs(final_motion_sample.z_minus_freefall));
                 max_abs_vz_minus_freefall =
@@ -320,6 +323,13 @@ int main(int ac, char *av[])
         std::cout << "sphere_particles: " << driven_sphere.particleCount() << '\n';
         std::cout << "sphere_mass_kg: " << sphere_mass() << '\n';
         std::cout << "sphere_weight_N: " << sphere_weight() << '\n';
+        std::cout << "wall_contact_enabled: yes\n";
+        std::cout << "wall_contact_planes_m: x=[" << kWallXMin << ',' << kWallXMax
+                  << "], y=[" << kWallYMin << ',' << kWallYMax
+                  << "], z=[" << kBottomWallZ << ",open]\n";
+        std::cout << "contact_normal_stiffness_N_per_m: " << kContactNormalStiffness << '\n';
+        std::cout << "contact_restitution: " << kContactRestitution << '\n';
+        std::cout << "contact_friction: " << kContactFriction << '\n';
         std::cout << "force_relaxation_alpha: " << kForceRelaxationAlpha << '\n';
         std::cout << "force_cap_N: " << kForceCapWeightFactor * sphere_weight() << '\n';
         std::cout << "force_cap_trigger_count: " << force_stats.cap_count << '\n';
@@ -350,6 +360,8 @@ int main(int ac, char *av[])
         std::cout << "final_z_two_way_m: " << final_z_two_way << '\n';
         std::cout << "final_z_freefall_m: " << final_z_freefall << '\n';
         std::cout << "final_z_difference_m: " << final_motion_sample.z_minus_freefall << '\n';
+        std::cout << "final_bottom_wall_overlap_m: " << bottom_wall_overlap(final_motion_sample.dem_state.center) << '\n';
+        std::cout << "max_wall_contact_overlap_m: " << max_wall_contact_overlap << '\n';
         std::cout << "max_center_error_m: " << max_center_error << '\n';
         std::cout << "max_abs_z_minus_freefall_m: " << max_abs_z_minus_freefall << '\n';
         std::cout << "max_abs_vz_minus_freefall_m_per_s: " << max_abs_vz_minus_freefall << '\n';

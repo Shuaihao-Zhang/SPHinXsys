@@ -5,8 +5,8 @@ SET(EXECUTABLE_OUTPUT_PATH "${PROJECT_BINARY_DIR}/bin/")
 
 add_executable(${PROJECT_NAME})
 target_sources(${PROJECT_NAME} PRIVATE
-    test_2d_lammps_two_way_water_entry.cpp
-    test_2d_lammps_two_way_water_entry.h)
+    test_2d_lammps_underwater_granular_collapse.cpp
+    test_2d_lammps_underwater_granular_collapse.h)
 target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
 target_link_libraries(${PROJECT_NAME} PRIVATE sphinxsys_2d sphinxsys_lammps_examples_common)
 set_target_properties(${PROJECT_NAME} PROPERTIES
@@ -29,4 +29,13 @@ add_test(NAME ${PROJECT_NAME}
     COMMAND ${PROJECT_NAME}
     WORKING_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
 
-set_tests_properties(${PROJECT_NAME} PROPERTIES LABELS "lammps;water-entry;2d")
+add_test(NAME ${PROJECT_NAME}_particle_relaxation
+    COMMAND ${PROJECT_NAME} --relax=true --state_recording=false
+    WORKING_DIRECTORY "${EXECUTABLE_OUTPUT_PATH}")
+
+set_tests_properties(${PROJECT_NAME} PROPERTIES
+    LABELS "lammps;granular-collapse;2d"
+    RUN_SERIAL TRUE)
+set_tests_properties(${PROJECT_NAME}_particle_relaxation PROPERTIES
+    LABELS "lammps;granular-collapse;2d;particle-relaxation"
+    RUN_SERIAL TRUE)

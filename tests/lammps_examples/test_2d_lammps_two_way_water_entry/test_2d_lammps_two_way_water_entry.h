@@ -1,7 +1,8 @@
 #pragma once
 
 #include "sphinxsys.h"
-#include "library.h"
+#include "lammps_instance.h"
+#include "lammps_io.h"
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,13 @@ using namespace SPH;
 
 namespace LammpsTwoWayWaterEntry2D
 {
+using SPH::lammps_examples::LammpsInstance;
+using SPH::lammps_examples::VtpPvdWriter;
+using SPH::lammps_examples::VtpScalarField;
+using SPH::lammps_examples::VtpVectorField2d;
+using SPH::lammps_examples::lammps_example_output_path;
+using SPH::lammps_examples::write_dem_cylinder_to_vtp;
+using SPH::lammps_examples::write_dem_point_fields_to_vtp;
 //----------------------------------------------------------------------
 //	Basic geometry parameters and numerical setup.
 //----------------------------------------------------------------------
@@ -228,67 +236,6 @@ inline Vec2d to_vec2d(const std::array<double, 3> &values)
 {
     return Vec2d(values[0], values[1]);
 }
-
-class LammpsInstance
-{
-  public:
-    LammpsInstance()
-    {
-        const char *args[] = {"liblammps", "-log", "none", "-screen", "none", "-nocite", nullptr};
-        auto **argv = const_cast<char **>(args);
-        const int argc = static_cast<int>((sizeof(args) / sizeof(char *)) - 1);
-
-        handle_ = lammps_open_no_mpi(argc, argv, nullptr);
-        if (handle_ == nullptr)
-        {
-            throw std::runtime_error("lammps_open_no_mpi returned null");
-        }
-    }
-
-    LammpsInstance(const LammpsInstance &) = delete;
-    LammpsInstance &operator=(const LammpsInstance &) = delete;
-
-    ~LammpsInstance()
-    {
-        if (handle_ != nullptr)
-        {
-            lammps_close(handle_);
-        }
-    }
-
-    void *get() const { return handle_; }
-
-    int version() const { return lammps_version(handle_); }
-
-    void command(const std::string &cmd, const std::string &context) const
-    {
-        lammps_command(handle_, cmd.c_str());
-        throw_if_error(context);
-    }
-
-    void commands_string(const std::string &cmds, const std::string &context) const
-    {
-        lammps_commands_string(handle_, cmds.c_str());
-        throw_if_error(context);
-    }
-
-    void throw_if_error(const std::string &context) const
-    {
-        if (lammps_has_error(handle_) == 0)
-        {
-            return;
-        }
-
-        char buffer[4096] = {};
-        lammps_get_last_error_message(handle_, buffer, static_cast<int>(sizeof(buffer)));
-        std::ostringstream msg;
-        msg << context << " failed: " << buffer;
-        throw std::runtime_error(msg.str());
-    }
-
-  private:
-    void *handle_ = nullptr;
-};
 
 class LammpsDEMAdapter
 {
@@ -598,25 +545,6 @@ inline bool is_finite(const Vec2d &value)
     return std::isfinite(value[0]) && std::isfinite(value[1]);
 }
 
-inline std::string format_iteration_index(int iteration)
-{
-    std::ostringstream stream;
-    stream << std::setw(10) << std::setfill('0') << iteration;
-    return stream.str();
-}
-
-inline std::filesystem::path dem_output_path(const std::string &prefix, int iteration)
-{
-    std::filesystem::path folder(IO::getEnvironment().OutputFolder());
-    std::filesystem::create_directories(folder);
-    return folder / (prefix + "_ite_" + format_iteration_index(iteration) + ".vtp");
-}
-
-inline void write_vec3(std::ofstream &file, const Vec2d &value)
-{
-    file << value[0] << ' ' << value[1] << " 0";
-}
-
 inline Vec2d gravity_force()
 {
     return Vec2d(0.0, -cylinder_weight());
@@ -632,102 +560,6 @@ inline Vec2d estimated_bottom_contact_force(const DEMState &dem_state, const Vec
     return net_force_from_lammps(dem_state) - gravity_force() - applied_hydro_force;
 }
 
-inline void write_vtp_time_value(std::ofstream &file, Real time)
-{
-    file << "    <FieldData>\n"
-         << "      <DataArray type=\"Float64\" Name=\"TimeValue\" NumberOfTuples=\"1\" format=\"ascii\">\n"
-         << "        " << time << "\n"
-         << "      </DataArray>\n"
-         << "    </FieldData>\n";
-}
-
-inline std::filesystem::path write_dem_cylinder_to_vtp(int iteration, Real time, const Vec2d &center, Real radius)
-{
-    constexpr int circle_segments = 128;
-    const std::filesystem::path file_path = dem_output_path("DEM_Cylinder", iteration);
-    std::ofstream file(file_path);
-    if (!file)
-    {
-        throw std::runtime_error("could not open DEM cylinder VTP for writing");
-    }
-
-    file << std::setprecision(17);
-    file << "<?xml version=\"1.0\"?>\n"
-         << "<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\">\n"
-         << "  <PolyData>\n";
-    write_vtp_time_value(file, time);
-    file << "    <Piece NumberOfPoints=\"" << circle_segments + 1
-         << "\" NumberOfVerts=\"1\" NumberOfLines=\"1\" NumberOfPolys=\"1\">\n"
-         << "      <PointData Scalars=\"Radius\">\n"
-         << "        <DataArray type=\"Float64\" Name=\"Radius\" NumberOfComponents=\"1\" format=\"ascii\">\n"
-         << "          ";
-    for (int i = 0; i <= circle_segments; ++i)
-    {
-        file << radius << ' ';
-    }
-    file << "\n"
-         << "        </DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"DEMCenter\" NumberOfComponents=\"3\" format=\"ascii\">\n"
-         << "          ";
-    for (int i = 0; i <= circle_segments; ++i)
-    {
-        write_vec3(file, center);
-        file << ' ';
-    }
-    file << "\n"
-         << "        </DataArray>\n"
-         << "      </PointData>\n"
-         << "      <Points>\n"
-         << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">\n"
-         << "          ";
-    write_vec3(file, center);
-    file << '\n';
-    for (int i = 0; i < circle_segments; ++i)
-    {
-        const Real angle = 2.0 * Pi * static_cast<Real>(i) / static_cast<Real>(circle_segments);
-        const Vec2d point(center[0] + radius * std::cos(angle),
-                          center[1] + radius * std::sin(angle));
-        file << "          ";
-        write_vec3(file, point);
-        file << '\n';
-    }
-    file << "        </DataArray>\n"
-         << "      </Points>\n"
-         << "      <Verts>\n"
-         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">0</DataArray>\n"
-         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">1</DataArray>\n"
-         << "      </Verts>\n"
-         << "      <Lines>\n"
-         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n"
-         << "          ";
-    for (int i = 1; i <= circle_segments; ++i)
-    {
-        file << i << ' ';
-    }
-    file << "1\n"
-         << "        </DataArray>\n"
-         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">"
-         << circle_segments + 1 << "</DataArray>\n"
-         << "      </Lines>\n"
-         << "      <Polys>\n"
-         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">\n"
-         << "          ";
-    for (int i = 1; i <= circle_segments; ++i)
-    {
-        file << i << ' ';
-    }
-    file << "\n"
-         << "        </DataArray>\n"
-         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">"
-         << circle_segments << "</DataArray>\n"
-         << "      </Polys>\n"
-         << "    </Piece>\n"
-         << "  </PolyData>\n"
-         << "</VTKFile>\n";
-
-    return file_path;
-}
-
 inline std::filesystem::path write_dem_force_to_vtp(int iteration,
                                                     Real time,
                                                     const DEMState &dem_state,
@@ -736,64 +568,28 @@ inline std::filesystem::path write_dem_force_to_vtp(int iteration,
 {
     const Vec2d net_force = net_force_from_lammps(dem_state);
     const Vec2d contact_force = estimated_bottom_contact_force(dem_state, applied_hydro_force);
-    const std::filesystem::path file_path = dem_output_path("DEM_Force", iteration);
-    std::ofstream file(file_path);
-    if (!file)
-    {
-        throw std::runtime_error("could not open DEM force VTP for writing");
-    }
 
-    file << std::setprecision(17);
-    file << "<?xml version=\"1.0\"?>\n"
-         << "<VTKFile type=\"PolyData\" version=\"0.1\" byte_order=\"LittleEndian\">\n"
-         << "  <PolyData>\n";
-    write_vtp_time_value(file, time);
-    file << "    <Piece NumberOfPoints=\"1\" NumberOfVerts=\"1\" NumberOfLines=\"0\" NumberOfPolys=\"0\">\n"
-         << "      <PointData Vectors=\"HydrodynamicForceApplied\">\n"
-         << "        <DataArray type=\"Float64\" Name=\"HydrodynamicForceRaw\" NumberOfComponents=\"3\" format=\"ascii\">";
-    write_vec3(file, raw_hydro_force);
-    file << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"HydrodynamicForceApplied\" NumberOfComponents=\"3\" format=\"ascii\">";
-    write_vec3(file, applied_hydro_force);
-    file << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"GravityForce\" NumberOfComponents=\"3\" format=\"ascii\">";
-    write_vec3(file, gravity_force());
-    file << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"NetForceFromLAMMPS\" NumberOfComponents=\"3\" format=\"ascii\">";
-    write_vec3(file, net_force);
-    file << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"EstimatedBottomContactForce\" NumberOfComponents=\"3\" format=\"ascii\">";
-    write_vec3(file, contact_force);
-    file << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"Velocity\" NumberOfComponents=\"3\" format=\"ascii\">";
-    write_vec3(file, dem_state.velocity);
-    file << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"Acceleration\" NumberOfComponents=\"3\" format=\"ascii\">";
-    write_vec3(file, dem_state.acceleration);
-    file << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"Radius\" NumberOfComponents=\"1\" format=\"ascii\">"
-         << kCylinderRadius << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"MassPerUnitDepth\" NumberOfComponents=\"1\" format=\"ascii\">"
-         << cylinder_mass() << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"Time\" NumberOfComponents=\"1\" format=\"ascii\">"
-         << time << "</DataArray>\n"
-         << "        <DataArray type=\"Float64\" Name=\"BottomContactOverlap\" NumberOfComponents=\"1\" format=\"ascii\">"
-         << bottom_wall_overlap(dem_state.center) << "</DataArray>\n"
-         << "      </PointData>\n"
-         << "      <Points>\n"
-         << "        <DataArray type=\"Float64\" NumberOfComponents=\"3\" format=\"ascii\">";
-    write_vec3(file, dem_state.center);
-    file << "</DataArray>\n"
-         << "      </Points>\n"
-         << "      <Verts>\n"
-         << "        <DataArray type=\"Int32\" Name=\"connectivity\" format=\"ascii\">0</DataArray>\n"
-         << "        <DataArray type=\"Int32\" Name=\"offsets\" format=\"ascii\">1</DataArray>\n"
-         << "      </Verts>\n"
-         << "    </Piece>\n"
-         << "  </PolyData>\n"
-         << "</VTKFile>\n";
-
-    return file_path;
+    return write_dem_point_fields_to_vtp(
+        iteration,
+        time,
+        "DEM_Force",
+        dem_state.center,
+        {
+            {"HydrodynamicForceRaw", raw_hydro_force},
+            {"HydrodynamicForceApplied", applied_hydro_force},
+            {"GravityForce", gravity_force()},
+            {"NetForceFromLAMMPS", net_force},
+            {"EstimatedBottomContactForce", contact_force},
+            {"Velocity", dem_state.velocity},
+            {"Acceleration", dem_state.acceleration},
+        },
+        {
+            {"Radius", kCylinderRadius},
+            {"MassPerUnitDepth", cylinder_mass()},
+            {"Time", time},
+            {"BottomContactOverlap", bottom_wall_overlap(dem_state.center)},
+        },
+        "HydrodynamicForceApplied");
 }
 
 inline std::string generate_cylinder_boundary_particles(SPHSystem &sph_system, SolidBody &cylinder_boundary)
