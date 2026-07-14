@@ -20,7 +20,7 @@ int main(int ac, char *av[])
         //----------------------------------------------------------------------
         SPHSystem sph_system(kSystemDomainBounds, kParticleSpacing);
         sph_system.setRunParticleRelaxation(false);
-        sph_system.setReloadParticles(reload_particle_file_exists() || std::filesystem::exists(fixed_sphere_reload_file()));
+        sph_system.setReloadParticles(false);
         sph_system.handleCommandlineOptions(ac, av);
 
         if (sph_system.RunParticleRelaxation())
@@ -126,6 +126,11 @@ int main(int ac, char *av[])
         const std::filesystem::path force_csv_path = "sphere_force.csv";
         const std::filesystem::path runtime_path = SPH::lammps_examples::lammps_runtime_path();
         const std::filesystem::path output_path = std::filesystem::absolute(IO::getEnvironment().OutputFolder());
+        VtpPvdWriter water_body_pvd("WaterBody");
+        VtpPvdWriter wall_boundary_pvd("WallBoundary");
+        VtpPvdWriter sphere_proxy_pvd("LammpsTwoWayWaterEntrySphere");
+        VtpPvdWriter dem_load_pvd("DEM_Load");
+        VtpPvdWriter dem_sphere_pvd("DEM_Sphere");
 
         std::ofstream motion_csv(motion_csv_path);
         std::ofstream force_csv(force_csv_path);
@@ -188,8 +193,16 @@ int main(int ac, char *av[])
         finite_state = finite_state && is_finite(dem_state.center) && is_finite(dem_state.velocity) &&
                        is_finite(raw_force) && is_finite(previous_applied_force);
         write_real_body_states.writeToFile(0);
+        water_body_pvd.add(physical_time, lammps_example_output_path("WaterBody", 0));
+        wall_boundary_pvd.add(physical_time, lammps_example_output_path("WallBoundary", 0));
+        sphere_proxy_pvd.add(physical_time, lammps_example_output_path("LammpsTwoWayWaterEntrySphere", 0));
         std::filesystem::path latest_dem_load_vtp = write_dem_load_to_vtp(
             0, physical_time, dem_state, raw_force, previous_applied_force, raw_hydrodynamic_torque);
+        dem_load_pvd.add(physical_time, latest_dem_load_vtp);
+        std::filesystem::path latest_dem_sphere_vtp = write_dem_sphere_to_vtp(
+            0, physical_time, dem_state.center, kSphereRadius);
+        dem_sphere_pvd.add(physical_time, latest_dem_sphere_vtp);
+        int dem_visualization_output_count = 1;
 
         //----------------------------------------------------------------------
         //	Main loop starts here. The outer loop follows the fluid advection
@@ -295,9 +308,17 @@ int main(int ac, char *av[])
                 {
                     output_iteration = number_of_iterations;
                     write_real_body_states.writeToFile(output_iteration);
+                    water_body_pvd.add(physical_time, lammps_example_output_path("WaterBody", output_iteration));
+                    wall_boundary_pvd.add(physical_time, lammps_example_output_path("WallBoundary", output_iteration));
+                    sphere_proxy_pvd.add(physical_time, lammps_example_output_path("LammpsTwoWayWaterEntrySphere", output_iteration));
                     latest_dem_load_vtp = write_dem_load_to_vtp(
                         output_iteration, physical_time, dem_state, raw_force,
                         previous_applied_force, raw_hydrodynamic_torque);
+                    dem_load_pvd.add(physical_time, latest_dem_load_vtp);
+                    latest_dem_sphere_vtp = write_dem_sphere_to_vtp(
+                        output_iteration, physical_time, dem_state.center, kSphereRadius);
+                    dem_sphere_pvd.add(physical_time, latest_dem_sphere_vtp);
+                    ++dem_visualization_output_count;
                     next_output_time += kVtpOutputInterval;
                 }
             }
@@ -341,7 +362,14 @@ int main(int ac, char *av[])
         std::cout << "sphere_motion_csv: " << std::filesystem::absolute(motion_csv_path).string() << '\n';
         std::cout << "sphere_force_csv: " << std::filesystem::absolute(force_csv_path).string() << '\n';
         std::cout << "VTP_output_folder: " << output_path.string() << '\n';
+        std::cout << "WaterBody_pvd: " << std::filesystem::absolute(water_body_pvd.path()).string() << '\n';
+        std::cout << "WallBoundary_pvd: " << std::filesystem::absolute(wall_boundary_pvd.path()).string() << '\n';
+        std::cout << "SPH_sphere_proxy_pvd: " << std::filesystem::absolute(sphere_proxy_pvd.path()).string() << '\n';
+        std::cout << "DEM_load_pvd: " << std::filesystem::absolute(dem_load_pvd.path()).string() << '\n';
         std::cout << "DEM_load_vtp_latest: " << std::filesystem::absolute(latest_dem_load_vtp).string() << '\n';
+        std::cout << "DEM_sphere_pvd: " << std::filesystem::absolute(dem_sphere_pvd.path()).string() << '\n';
+        std::cout << "DEM_sphere_vtp_latest: " << std::filesystem::absolute(latest_dem_sphere_vtp).string() << '\n';
+        std::cout << "DEM_visualization_output_count: " << dem_visualization_output_count << '\n';
         std::cout << "reload_file: " << std::filesystem::absolute(reload_particle_file()).string() << '\n';
         std::cout << "sphere_particle_source: " << sphere_particle_source << '\n';
         std::cout << "water_particles: " << water_block.getBaseParticles().TotalRealParticles() << '\n';
@@ -411,6 +439,20 @@ int main(int ac, char *av[])
         if (!std::filesystem::exists(latest_dem_load_vtp))
         {
             std::cerr << "ERROR: the 3D DEM load VTP file was not written.\n";
+            return 1;
+        }
+        if (!std::filesystem::exists(latest_dem_sphere_vtp))
+        {
+            std::cerr << "ERROR: the 3D DEM sphere VTP file was not written.\n";
+            return 1;
+        }
+        if (!std::filesystem::exists(water_body_pvd.path()) ||
+            !std::filesystem::exists(wall_boundary_pvd.path()) ||
+            !std::filesystem::exists(sphere_proxy_pvd.path()) ||
+            !std::filesystem::exists(dem_load_pvd.path()) ||
+            !std::filesystem::exists(dem_sphere_pvd.path()))
+        {
+            std::cerr << "ERROR: one or more PVD time-series files were not written.\n";
             return 1;
         }
         if (external_force.callbackCalls() <= 0 || external_force.atomUpdates() <= 0)

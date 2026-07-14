@@ -30,23 +30,26 @@ using SPH::lammps_examples::CouplingStepPlan;
 using SPH::lammps_examples::ExternalForceBuffer;
 using SPH::lammps_examples::LammpsTimeIntegrator;
 using SPH::lammps_examples::ParticleForce;
+using SPH::lammps_examples::VtpPvdWriter;
 using SPH::lammps_examples::makeCouplingStepPlan;
+using SPH::lammps_examples::lammps_example_output_path;
 using SPH::lammps_examples::extract_atom_vector3_by_consecutive_id;
 using SPH::lammps_examples::validate_consecutive_atom_ids;
+using SPH::lammps_examples::write_dem_sphere_to_vtp;
 //----------------------------------------------------------------------
 //	Basic geometry parameters and numerical setup.
 //----------------------------------------------------------------------
-inline constexpr Real kTankLengthX = 0.12;
-inline constexpr Real kTankLengthY = 0.12;
-inline constexpr Real kTankHeightZ = 0.16;
-inline constexpr Real kWaterHeight = 0.12;
+inline constexpr Real kTankLengthX = 0.08;
+inline constexpr Real kTankLengthY = 0.08;
+inline constexpr Real kTankHeightZ = 0.12;
+inline constexpr Real kWaterHeight = 0.08;
 inline constexpr Real kSphereRadius = 0.01;
 inline constexpr Real kSphereDiameter = 2.0 * kSphereRadius;
 inline constexpr Real kParticleSpacing = kSphereDiameter / 10.0;
 inline constexpr Real kBoundaryWidth = 4.0 * kParticleSpacing;
 inline constexpr Real kInitialClearance = 0.010;
-inline constexpr Real kEndTime = 0.06;
-inline constexpr Real kVtpOutputInterval = 0.01;
+inline constexpr Real kEndTime = 1.0;
+inline constexpr Real kVtpOutputInterval = 0.02;
 inline constexpr double kDemMaxDt = 1.0e-5;
 inline constexpr int kRelaxationSteps = 1000;
 inline constexpr int kRelaxationOutputInterval = 200;
